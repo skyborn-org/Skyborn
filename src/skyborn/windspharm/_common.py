@@ -75,14 +75,13 @@ def inspect_gridtype(latitudes: ArrayLike) -> GridType:
 
     Analyzes the spacing and distribution of latitude points to determine
     whether they correspond to a regular (equally-spaced) or Gaussian grid.
-    This is essential for selecting the appropriate spherical harmonic
-    analysis method.
+    Accepts monotonic global grids ordered north-to-south or south-to-north.
 
     Parameters
     ----------
     latitudes : array_like
-        Array of latitude coordinate values in degrees. Should be ordered
-        from north to south (90° to -90°).
+        Array of monotonically increasing or decreasing latitude coordinate
+        values in degrees.
 
     Returns
     -------
@@ -111,7 +110,7 @@ def inspect_gridtype(latitudes: ArrayLike) -> GridType:
     >>> print(gridtype)  # 'gaussian'
     """
     # Convert to numpy array for consistent handling
-    latitudes = np.asarray(latitudes)
+    latitudes = np.asarray(latitudes, dtype=np.float64)
 
     # Define tolerance for floating-point comparisons
     # This must be much smaller than typical grid spacings
@@ -124,15 +123,18 @@ def inspect_gridtype(latitudes: ArrayLike) -> GridType:
             f"Need at least 2 latitude points for grid type detection, got {nlat}"
         )
 
+    # Normalize to north-to-south for global grid verification
+    lat_n2s = latitudes[::-1] if latitudes[0] < latitudes[-1] else latitudes
+
     # Check if latitudes are equally spaced
-    diffs = np.abs(np.diff(latitudes))
+    diffs = np.abs(np.diff(lat_n2s))
     equally_spaced = (np.abs(diffs - diffs[0]) < tolerance).all()
 
     if not equally_spaced:
         # Not equally-spaced - check if they match Gaussian latitudes
         try:
             gauss_reference, _ = gaussian_lats_wts(nlat)
-            difference = np.abs(latitudes - gauss_reference)
+            difference = np.abs(lat_n2s - gauss_reference)
             if np.any(difference > tolerance):
                 raise ValueError(
                     f"Latitudes are neither equally-spaced nor Gaussian. "
@@ -156,7 +158,7 @@ def inspect_gridtype(latitudes: ArrayLike) -> GridType:
                 90 - 0.5 * delta_latitude, -90 + 0.5 * delta_latitude, nlat
             )
 
-        difference = np.abs(latitudes - equal_reference)
+        difference = np.abs(lat_n2s - equal_reference)
         if np.any(difference > tolerance):
             raise ValueError(
                 f"Equally-spaced latitudes don't match global regular grid pattern. "

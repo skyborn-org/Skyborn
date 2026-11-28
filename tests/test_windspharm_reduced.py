@@ -414,3 +414,42 @@ def test_reduced_vectorwind_rossbywavesource_reuses_cached_planetary_spectrum(
     assert first.shape == u.shape
     assert second.shape == u.shape
     np.testing.assert_allclose(first, second)
+
+
+@pytest.mark.skipif(not WINDSPHARM_AVAILABLE, reason="windspharm module not available")
+def test_reduced_vectorwind_double_precision_and_corder_s2n():
+    """Verify ReducedVectorWind preserves float64 precision, auto C-layout, and S2N."""
+    from skyborn.spharm import gaussian_lats_wts
+
+    pl = np.array([16, 20, 24, 28, 32, 28, 24, 20, 16], dtype=np.int32)
+    npoints = int(pl.sum())
+    rng = np.random.default_rng(20261129)
+    u_c = rng.standard_normal((3, npoints)).astype(np.float64)
+    v_c = rng.standard_normal((3, npoints)).astype(np.float64)
+    scalar_c = rng.standard_normal((3, npoints)).astype(np.float64)
+
+    vw_c = ReducedVectorWind(u_c, v_c, pl)
+    assert vw_c.layout == "c"
+    assert vw_c.precision == "auto"
+    assert vw_c.rotationalcomponent == vw_c.nondivergentcomponent
+    assert vw_c.divergentcomponent == vw_c.irrotationalcomponent
+    assert vw_c._u_backend.dtype == np.float64
+
+    # Double-precision roundtrip via truncate must far exceed float32 accuracy (~1e-6)
+    trunc = vw_c.truncate(scalar_c, truncation=5)
+    assert trunc.dtype == np.float64
+    np.testing.assert_allclose(
+        vw_c.truncate(trunc, truncation=5),
+        trunc,
+        rtol=1e-12,
+        atol=1e-12,
+    )
+
+    vw_leg = ReducedVectorWind(u_c.T.copy(), v_c.T.copy(), pl)
+    assert vw_leg.layout == "legacy"
+    np.testing.assert_allclose(vw_c.vorticity(truncation=5), vw_leg.vorticity(truncation=5).T, rtol=0, atol=0)
+
+    lats_n2s, _ = gaussian_lats_wts(len(pl))
+    vw_s2n = ReducedVectorWind(u_c, v_c, pl, lat=lats_n2s[::-1].copy())
+    assert vw_s2n.south_to_north is True
+    assert np.isfinite(vw_s2n.absolutevorticity(truncation=5)).all()

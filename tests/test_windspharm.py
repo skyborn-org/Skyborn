@@ -1576,13 +1576,17 @@ class TestWindSpharmTargetedCoverage:
         vw = VectorWind(u, v)
 
         calls = {"count": 0}
-        original_spectogrd = vw.s.spectogrd
+        real_core = vw.s._core
 
-        def counting_spectogrd(*args, **kwargs):
-            calls["count"] += 1
-            return original_spectogrd(*args, **kwargs)
+        class CoreProxy:
+            def __getattr__(self, name):
+                return getattr(real_core, name)
 
-        monkeypatch.setattr(vw.s, "spectogrd", counting_spectogrd)
+            def spectogrd(self, *args, **kwargs):
+                calls["count"] += 1
+                return real_core.spectogrd(*args, **kwargs)
+
+        monkeypatch.setattr(vw.s, "_core", CoreProxy())
 
         vrt, div = vw.vrtdiv()
 
@@ -1600,15 +1604,17 @@ class TestWindSpharmTargetedCoverage:
         vw = VectorWind(u, v)
 
         calls = {"count": 0}
-        original_analyze = vw.s._analyze_vector_harmonics_flattened
+        real_core = vw.s._core
 
-        def counting_analyze(*args, **kwargs):
-            calls["count"] += 1
-            return original_analyze(*args, **kwargs)
+        class CoreProxy:
+            def __getattr__(self, name):
+                return getattr(real_core, name)
 
-        monkeypatch.setattr(
-            vw.s, "_analyze_vector_harmonics_flattened", counting_analyze
-        )
+            def getvrtdivspec(self, *args, **kwargs):
+                calls["count"] += 1
+                return real_core.getvrtdivspec(*args, **kwargs)
+
+        monkeypatch.setattr(vw.s, "_core", CoreProxy())
         monkeypatch.setattr(
             vw.s,
             "getchispec",
@@ -1687,28 +1693,20 @@ class TestWindSpharmTargetedCoverage:
         assert vw._vector_analysis_spectral(truncation=7, component="div") == ("div", 7)
 
     def test_vector_analysis_prepared_layout_cache_is_reused(self, monkeypatch):
-        """Prepared Fortran-order wind inputs should be built once per instance."""
+        """Prepared C-order wind inputs should be built once per instance."""
         nlat, nlon = 19, 36
         rng = np.random.default_rng(20260502)
         u = rng.standard_normal((nlat, nlon, 2, 3)).astype(np.float32)
         v = rng.standard_normal((nlat, nlon, 2, 3)).astype(np.float32)
         vw = VectorWind(u, v)
 
-        calls = {"count": 0}
-        original_asfortranarray = standard.np.asfortranarray
         original_layout_builder = vw._vector_analysis_layout_inputs
-
-        def counting_asfortranarray(*args, **kwargs):
-            calls["count"] += 1
-            return original_asfortranarray(*args, **kwargs)
-
         layout_calls = {"count": 0}
 
         def counting_layout_builder():
             layout_calls["count"] += 1
             return original_layout_builder()
 
-        monkeypatch.setattr(standard.np, "asfortranarray", counting_asfortranarray)
         monkeypatch.setattr(
             vw, "_vector_analysis_layout_inputs", counting_layout_builder
         )
@@ -1718,9 +1716,8 @@ class TestWindSpharmTargetedCoverage:
         vw.sfvp()
 
         assert layout_calls["count"] == 3
-        assert calls["count"] >= 2
-        assert vw._vector_analysis_layout_cache[0].flags["F_CONTIGUOUS"]
-        assert vw._vector_analysis_layout_cache[1].flags["F_CONTIGUOUS"]
+        assert vw._vector_analysis_layout_cache[0].flags["C_CONTIGUOUS"]
+        assert vw._vector_analysis_layout_cache[1].flags["C_CONTIGUOUS"]
 
     def test_component_paths_match_direct_spectral_expression(self):
         """Component wind paths should use direct spectral reconstruction."""
@@ -1857,6 +1854,295 @@ class TestWindSpharmTargetedCoverage:
 
         data_dir = Path(example_data_path())
         assert data_dir.name == "example_data"
+
+    @pytest.mark.skipif(
+        not WINDSPHARM_AVAILABLE, reason="windspharm module not available"
+    )
+    def test_vectorwind_auto_layout_and_s2n_alignment(self):
+        """VectorWind defaults to auto layout for C-order & legacy and supports S2N."""
+        rng = np.random.default_rng(20261128)
+        u_c = rng.standard_normal((3, 2, 19, 36)).astype(np.float32)
+        v_c = rng.standard_normal((3, 2, 19, 36)).astype(np.float32)
+        vw_auto_c = VectorWind(u_c, v_c, gridtype="regular")
+        vw_expl_c = VectorWind(u_c, v_c, gridtype="regular", layout="c")
+        assert vw_auto_c.layout == "c"
+        assert vw_auto_c.precision == "auto"
+        assert vw_auto_c.lat_order == "auto"
+        assert vw_auto_c.south_to_north is False
+        np.testing.assert_allclose(vw_auto_c.vorticity(), vw_expl_c.vorticity(), rtol=0, atol=0)
+        np.testing.assert_allclose(
+            vw_auto_c.rossbywavesource(), vw_expl_c.rossbywavesource(), rtol=0, atol=0
+        )
+
+        # Ambiguous C-order 3D vs legacy F-order 3D
+        u_l = np.transpose(u_c.reshape(6, 19, 36), (1, 2, 0)).copy()
+        v_l = np.transpose(v_c.reshape(6, 19, 36), (1, 2, 0)).copy()
+        vw_auto_l = VectorWind(u_l, v_l, gridtype="regular")
+        vw_expl_l = VectorWind(u_l, v_l, gridtype="regular", layout="legacy")
+        assert vw_auto_l.layout == "legacy"
+        np.testing.assert_allclose(vw_auto_l.vorticity(), vw_expl_l.vorticity(), rtol=0, atol=0)
+
+        # South-to-North without explicit lat array
+        u_s2n = u_c[:, :, ::-1, :].copy()
+        v_s2n = v_c[:, :, ::-1, :].copy()
+        vw_s2n = VectorWind(u_s2n, v_s2n, gridtype="regular", lat_order="s2n")
+        assert vw_s2n.south_to_north is True
+        np.testing.assert_allclose(
+            vw_s2n.planetaryvorticity(),
+            vw_auto_c.planetaryvorticity()[:, :, ::-1, :],
+            rtol=1e-6,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            vw_s2n.rossbywavesource(),
+            vw_auto_c.rossbywavesource()[:, :, ::-1, :],
+            rtol=1e-5,
+            atol=1e-9,
+        )
+
+        # inspect_gridtype accepts both N2S and S2N regular & Gaussian
+        assert common_mod.inspect_gridtype(np.linspace(-90.0, 90.0, 73)) == "regular"
+        assert common_mod.inspect_gridtype(np.linspace(90.0, -90.0, 73)) == "regular"
+        from skyborn.spharm import gaussian_lats_wts
+
+        glat_n2s, _ = gaussian_lats_wts(32)
+        assert common_mod.inspect_gridtype(glat_n2s[::-1]) == "gaussian"
+
+    @pytest.mark.skipif(
+        not WINDSPHARM_AVAILABLE, reason="windspharm module not available"
+    )
+    def test_grid_pair_score_tiers_and_boundaries(self):
+        """Verify integer cross-multiplication _grid_pair_score across all score tiers and boundaries."""
+        score = VectorWind._grid_pair_score
+
+        # Tier -1: below minimum grid bounds (nlat < 3 or nlon < 4)
+        for bad_nlat, bad_nlon in [(2, 4), (3, 3), (0, 0), (-1, 10), (19, 3)]:
+            assert score(bad_nlat, bad_nlon, "regular") == -1
+            assert score(bad_nlat, bad_nlon, "gaussian") == -1
+
+        # Tier 4 regular: exact nlon == 2*(nlat-1) or nlon == 2*nlat (odd & even nlon included)
+        assert score(73, 144, "regular") == 4
+        assert score(181, 360, "regular") == 4
+        assert score(72, 144, "regular") == 4
+        assert score(3, 4, "regular") == 4
+        assert score(4, 6, "regular") == 4
+
+        # Tier 4 gaussian: even nlon and (nlon == 2*nlat or 1.8 <= nlon/nlat <= 2.25)
+        assert score(64, 128, "gaussian") == 4
+        assert score(94, 192, "gaussian") == 4
+        assert score(160, 320, "gaussian") == 4
+        assert score(10, 18, "Gaussian") == 4  # exact lower boundary 1.8
+        assert score(8, 18, "GAUSSIAN") == 4  # exact upper boundary 2.25
+        # Just outside [1.8, 2.25] drops to tier 3 (even nlon, within [1.2, 4.0])
+        assert score(10, 16, "gaussian") == 3
+        assert score(8, 20, "gaussian") == 3
+        # Odd nlon with 1.8 <= nlon/nlat <= 2.25 cannot be tier 4 gaussian -> tier 2
+        assert score(10, 21, "gaussian") == 2
+
+        # Tier 3: even nlon, 1.2 <= nlon/nlat <= 4.0, not tier 4
+        assert score(10, 12, "regular") == 3  # exact lower boundary 1.2
+        assert score(10, 40, "regular") == 3  # exact upper boundary 4.0
+        assert score(10, 12, "gaussian") == 3
+        assert score(10, 40, "gaussian") == 3
+
+        # Tier 2: odd nlon, 1.2 <= nlon/nlat <= 4.0, not tier 4
+        assert score(10, 15, "regular") == 2
+        assert score(5, 6, "regular") == 3  # 6 is even and exact 1.2
+        assert score(15, 19, "gaussian") == 2  # ~1.267, odd nlon
+
+        # Tier 1: nlon >= nlat outside [1.2, 4.0] (or 1.0 <= ratio < 1.2 or ratio > 4.0)
+        assert score(10, 10, "regular") == 1
+        assert score(10, 11, "regular") == 1
+        assert score(10, 42, "regular") == 1
+        assert score(10, 11, "gaussian") == 1
+        assert score(10, 41, "gaussian") == 1
+
+        # Tier 0: nlat >= 3, nlon >= 4, but nlon < nlat
+        assert score(20, 19, "regular") == 0
+        assert score(36, 19, "regular") == 0
+        assert score(36, 19, "gaussian") == 0
+
+    @pytest.mark.skipif(
+        not WINDSPHARM_AVAILABLE, reason="windspharm module not available"
+    )
+    def test_resolve_layout_disambiguation_tiebreakers_and_cache(self):
+        """Verify _resolve_layout across C/legacy N-D shapes, ties, lat hints, flags, and LRU cache."""
+        resolve = VectorWind._resolve_layout
+        standard._cached_resolve_auto_layout.cache_clear()
+
+        # Explicit overrides and invalid layout handling
+        assert resolve((19, 36, 4, 3), None, "C", "regular") == "c"
+        assert resolve((4, 3, 19, 36), None, "Legacy", "regular") == "legacy"
+        with pytest.raises(ValueError, match='layout must be "legacy", "c", or "auto"'):
+            resolve((19, 36), None, "invalid_layout", "regular")
+
+        # 2D auto always resolves to 'c'
+        assert resolve((19, 36), None, "auto", "regular") == "c"
+
+        # 3D, 4D, 5D C-order vs legacy recognition (regular & gaussian)
+        assert resolve((37, 181, 360), None, "auto", "regular") == "c"
+        assert resolve((181, 360, 37), None, "auto", "regular") == "legacy"
+        assert resolve((12, 8, 73, 144), None, "auto", "regular") == "c"
+        assert resolve((73, 144, 12, 8), None, "auto", "regular") == "legacy"
+        assert resolve((2, 3, 4, 19, 36), None, "auto", "regular") == "c"
+        assert resolve((19, 36, 2, 4, 3), None, "auto", "regular") == "legacy"
+        assert resolve((19, 36, 2, 3, 4), None, "auto", "regular") == "c"  # trailing (3, 4) ties score 4 -> C-preferring
+        assert resolve((10, 94, 192), None, "auto", "gaussian") == "c"
+        assert resolve((94, 192, 10), None, "auto", "gaussian") == "legacy"
+        assert resolve((1, 19, 36), None, "auto", "regular") == "c"
+
+        # Ambiguous equal-score 4D shapes: tie broken by F-only vs C contiguity
+        c_contig = np.zeros((19, 36, 19, 36), dtype=np.float32)
+        f_contig = np.asfortranarray(c_contig)
+        non_contig = c_contig[::1, ::1, ::1, ::1]
+        assert resolve(c_contig.shape, c_contig.flags, "auto", "regular") == "c"
+        assert resolve(f_contig.shape, f_contig.flags, "auto", "regular") == "legacy"
+        assert resolve(non_contig.shape, non_contig.flags, "auto", "regular") == "c"
+        # Missing or custom flags object fallback safety
+        class _DummyFlags:
+            f_contiguous = True
+            c_contiguous = False
+
+        assert resolve((19, 36, 19, 36), _DummyFlags(), "auto", "regular") == "legacy"
+        assert resolve((19, 36, 19, 36), None, "auto", "regular") == "c"
+
+        # Explicit 1D lat coordinate overrides score-based layout when unique match exists
+        ambig_shape = (19, 36, 37, 72)
+        assert resolve(ambig_shape, None, "auto", "regular", lat=np.linspace(90, -90, 37)) == "c"
+        assert resolve(ambig_shape, None, "auto", "regular", lat=np.linspace(90, -90, 19)) == "legacy"
+        # When 2D lat matches neither cleanly, falls back cleanly without error
+        assert resolve((3, 19, 36), None, "auto", "regular", lat=np.linspace(90, -90, 19)) == "c"
+
+        # Verify LRU cache populates and records hits cleanly
+        standard._cached_resolve_auto_layout.cache_clear()
+        first = resolve((5, 7, 73, 144), None, "auto", "regular")
+        second = resolve((5, 7, 73, 144), None, "auto", "regular")
+        info = standard._cached_resolve_auto_layout.cache_info()
+        assert first == "c" and second == "c"
+        assert info.misses >= 1 and info.hits >= 1
+
+    @pytest.mark.skipif(
+        not WINDSPHARM_AVAILABLE, reason="windspharm module not available"
+    )
+    def test_vectorwind_4d_and_5d_reshape_roundtrip_exact(self):
+        """Verify 4D/5D inputs automatically flatten to 3D internally and restore exact shapes & bit parity."""
+        rng = np.random.default_rng(20261129)
+        nlat, nlon = 19, 36
+
+        for dtype, batch_shape in [
+            (np.float32, (4, 3)),
+            (np.float64, (2, 2, 3)),
+        ]:
+            nt = int(np.prod(batch_shape))
+            u_nd = rng.standard_normal(batch_shape + (nlat, nlon)).astype(dtype)
+            v_nd = rng.standard_normal(batch_shape + (nlat, nlon)).astype(dtype)
+            u_3d = u_nd.reshape(nt, nlat, nlon)
+            v_3d = v_nd.reshape(nt, nlat, nlon)
+
+            vw_nd = VectorWind(u_nd, v_nd, gridtype="regular")
+            vw_3d = VectorWind(u_3d, v_3d, gridtype="regular", layout="c")
+            assert vw_nd.layout == "c"
+
+            scalar_nd = rng.standard_normal(batch_shape + (nlat, nlon)).astype(dtype)
+            scalar_3d = scalar_nd.reshape(nt, nlat, nlon)
+
+            for method in (
+                "magnitude",
+                "vorticity",
+                "divergence",
+                "planetaryvorticity",
+                "absolutevorticity",
+                "streamfunction",
+                "velocitypotential",
+                "rossbywavesource",
+            ):
+                out_nd = getattr(vw_nd, method)()
+                out_3d = getattr(vw_3d, method)()
+                assert out_nd.shape == batch_shape + (nlat, nlon)
+                assert out_nd.dtype == dtype
+                np.testing.assert_allclose(
+                    out_nd, out_3d.reshape(batch_shape + (nlat, nlon)), rtol=0, atol=0
+                )
+
+            for pair_method in (
+                "vrtdiv",
+                "sfvp",
+                "irrotationalcomponent",
+                "nondivergentcomponent",
+                "helmholtz",
+            ):
+                outs_nd = getattr(vw_nd, pair_method)()
+                outs_3d = getattr(vw_3d, pair_method)()
+                for arr_nd, arr_3d in zip(outs_nd, outs_3d):
+                    assert arr_nd.shape == batch_shape + (nlat, nlon)
+                    assert arr_nd.dtype == dtype
+                    np.testing.assert_allclose(
+                        arr_nd,
+                        arr_3d.reshape(batch_shape + (nlat, nlon)),
+                        rtol=0,
+                        atol=0,
+                    )
+
+            gx_nd, gy_nd = vw_nd.gradient(scalar_nd, truncation=11)
+            gx_3d, gy_3d = vw_3d.gradient(scalar_3d, truncation=11)
+            np.testing.assert_allclose(
+                gx_nd, gx_3d.reshape(batch_shape + (nlat, nlon)), rtol=0, atol=0
+            )
+            np.testing.assert_allclose(
+                gy_nd, gy_3d.reshape(batch_shape + (nlat, nlon)), rtol=0, atol=0
+            )
+
+            trunc_nd = vw_nd.truncate(scalar_nd, truncation=11)
+            trunc_3d = vw_3d.truncate(scalar_3d, truncation=11)
+            assert trunc_nd.shape == batch_shape + (nlat, nlon)
+            np.testing.assert_allclose(
+                trunc_nd, trunc_3d.reshape(batch_shape + (nlat, nlon)), rtol=0, atol=0
+            )
+
+        # 4D legacy shape (nlat, nlon, 4, 3) also preserves exact shape & values
+        u_4d_c = rng.standard_normal((4, 3, nlat, nlon)).astype(np.float32)
+        v_4d_c = rng.standard_normal((4, 3, nlat, nlon)).astype(np.float32)
+        u_4d_leg = np.moveaxis(u_4d_c, (2, 3), (0, 1)).copy()
+        v_4d_leg = np.moveaxis(v_4d_c, (2, 3), (0, 1)).copy()
+        vw_4d_c = VectorWind(u_4d_c, v_4d_c, gridtype="regular")
+        vw_4d_leg = VectorWind(u_4d_leg, v_4d_leg, gridtype="regular")
+        assert vw_4d_leg.layout == "legacy"
+
+        vrt_c = vw_4d_c.vorticity()
+        vrt_leg = vw_4d_leg.vorticity()
+        assert vrt_leg.shape == (nlat, nlon, 4, 3)
+        np.testing.assert_allclose(
+            np.moveaxis(vrt_leg, (0, 1), (2, 3)), vrt_c, rtol=0, atol=0
+        )
+        rws_c = vw_4d_c.rossbywavesource()
+        rws_leg = vw_4d_leg.rossbywavesource()
+        assert rws_leg.shape == (nlat, nlon, 4, 3)
+        np.testing.assert_allclose(
+            np.moveaxis(rws_leg, (0, 1), (2, 3)), rws_c, rtol=0, atol=0
+        )
+
+        # xarray 4D DataArray (time, level, lat, lon) executes without axis transposition
+        xr = pytest.importorskip("xarray")
+        from skyborn.windspharm.xarray import VectorWind as XrVectorWind
+
+        lat = np.linspace(90.0, -90.0, nlat)
+        lon = np.linspace(0.0, 350.0, nlon)
+        da_u = xr.DataArray(
+            u_4d_c,
+            dims=("time", "level", "lat", "lon"),
+            coords={"time": np.arange(4), "level": [1000, 500, 200], "lat": lat, "lon": lon},
+        )
+        da_v = xr.DataArray(
+            v_4d_c,
+            dims=("time", "level", "lat", "lon"),
+            coords={"time": np.arange(4), "level": [1000, 500, 200], "lat": lat, "lon": lon},
+        )
+        xvw = XrVectorWind(da_u, da_v, gridtype="regular")
+        assert xvw._needs_transpose is False
+        xr_vrt = xvw.vorticity()
+        assert xr_vrt.dims == ("time", "level", "lat", "lon")
+        assert xr_vrt.shape == (4, 3, nlat, nlon)
+        np.testing.assert_allclose(xr_vrt.values, vrt_c, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -8,7 +8,9 @@ streamfunction, velocity potential, and other dynamical quantities.
 
 from __future__ import annotations
 
-from typing import Literal, Optional, Tuple, Union
+import math
+from functools import lru_cache
+from typing import Any, Literal, Optional, Tuple, Union
 
 import numpy as np
 
@@ -17,10 +19,49 @@ from skyborn.spharm import spherical_harmonics as spharm_mod
 
 __all__ = ["VectorWind"]
 
+_DTYPE_F32 = np.dtype(np.float32)
+_DTYPE_F64 = np.dtype(np.float64)
+_LAYOUT_ALIASES = {"auto": "auto", "c": "c", "legacy": "legacy"}
+_GRIDTYPE_IS_GAUSSIAN = {"regular": False, "gaussian": True}
+
+
+def _score_grid_pair(nlat: int, nlon: int, is_gaussian: bool) -> int:
+    """Score how plausible a (nlat, nlon) pair is for a global spherical grid."""
+    if nlat < 3 or nlon < 4:
+        return -1
+    if not is_gaussian:
+        if nlon == 2 * (nlat - 1) or nlon == 2 * nlat:
+            return 4
+    elif (nlon & 1) == 0 and (
+        nlon == 2 * nlat or (5 * nlon >= 9 * nlat and 4 * nlon <= 9 * nlat)
+    ):
+        return 4
+    # 1.2 <= (nlon / nlat) <= 4.0 already implies nlon > nlat for nlat >= 3
+    if 5 * nlon >= 6 * nlat and nlon <= 4 * nlat:
+        return 3 if (nlon & 1) == 0 else 2
+    return 1 if nlon >= nlat else 0
+
+
+@lru_cache(maxsize=256)
+def _cached_resolve_auto_layout(
+    shape: Tuple[int, ...], is_gaussian: bool, f_only: bool
+) -> str:
+    """Resolve and cache 'auto' layout ('c' vs 'legacy') from array shape and order."""
+    score_c = _score_grid_pair(shape[-2], shape[-1], is_gaussian)
+    score_l = _score_grid_pair(shape[0], shape[1], is_gaussian)
+    if score_c > score_l:
+        return "c"
+    if score_l > score_c:
+        return "legacy"
+    return "legacy" if f_only else "c"
+
 # Type aliases for better readability
 ArrayLike = Union[np.ndarray, np.ma.MaskedArray]
 GridType = Literal["regular", "gaussian"]
 LegFunc = Literal["stored", "computed"]
+PrecisionMode = Literal["auto", "single", "float32", "double", "float64"]
+LayoutMode = Literal["legacy", "c", "auto"]
+LatOrderMode = Literal["north_to_south", "south_to_north", "N2S", "S2N", "auto"]
 
 
 class VectorWind:
@@ -34,12 +75,10 @@ class VectorWind:
     Parameters
     ----------
     u : array_like
-        Zonal wind component. Shape should be (nlat, nlon) or
-        (nlat, nlon, *extra_dims), where nlat is latitude points and nlon is
-        longitude points. Latitude dimension should be north-to-south.
-        This follows the underlying SPHEREPACK convention that the first
-        latitude row is the northernmost point and latitude indices increase
-        southward.
+        Zonal wind component. Shape may be ``(..., nlat, nlon)`` (C-order,
+        zero-copy), ``(nlat, nlon)``, or legacy ``(nlat, nlon, *extra_dims)``.
+        When ``layout="auto"`` (default), both conventions are recognized
+        automatically without manual transposition.
     v : array_like
         Meridional wind component. Must have same shape as u.
     gridtype : {'regular', 'gaussian'}, default 'regular'
@@ -52,10 +91,17 @@ class VectorWind:
         Legendre function computation method:
         - 'stored': precompute and store (faster, more memory)
         - 'computed': compute on-the-fly (slower, less memory)
-    precision : {'auto', 'single', 'double'}, default 'auto'
+    precision : {'auto', 'single', 'float32', 'double', 'float64'}, default 'auto'
         Public output precision mode. 'auto' preserves the promoted input
-        floating precision, 'single' returns float32/complex64 outputs, and
-        'double' returns float64/complex128 outputs.
+        floating precision, 'single'/'float32' returns float32/complex64
+        outputs, and 'double'/'float64' returns float64/complex128 outputs.
+    layout : {'auto', 'c', 'legacy'}, default 'auto'
+        Array axis convention. ``'auto'`` detects C-order ``(..., nlat, nlon)``
+        and legacy ``(nlat, nlon, ...)`` automatically (preferring C-order).
+    lat_order : {'auto', 'N2S', 'S2N', 'north_to_south', 'south_to_north'}, default 'auto'
+        Latitude direction of the input grid (supports zero-copy south-to-north).
+    lat : ndarray, optional
+        Optional 1D latitude coordinate array for automatic ``S2N``/``N2S`` detection.
 
     Attributes
     ----------
@@ -71,6 +117,12 @@ class VectorWind:
         Legendre function handling mode used by the underlying transform
     precision : str
         Public output precision mode
+    layout : str
+        Resolved array layout mode (``'c'`` or ``'legacy'``)
+    lat_order : str
+        Normalized latitude order setting
+    south_to_north : bool
+        Whether the instance operates on south-to-north latitude rows
     s : Spharmt
         Spherical harmonic transform object
 
@@ -81,24 +133,22 @@ class VectorWind:
     >>>
     >>> # Create sample wind field
     >>> nlat, nlon = 73, 144
-    >>> u = np.random.randn(nlat, nlon)
-    >>> v = np.random.randn(nlat, nlon)
+    >>> u = np.random.randn(12, nlat, nlon)
+    >>> v = np.random.randn(12, nlat, nlon)
     >>>
-    >>> # Initialize VectorWind
+    >>> # Initialize VectorWind (C-order detected automatically)
     >>> vw = VectorWind(u, v, gridtype='gaussian')
     >>>
     >>> # Calculate dynamical quantities
     >>> vorticity = vw.vorticity()
     >>> divergence = vw.divergence()
-    >>> streamfunction = vw.streamfunction()
-    >>> velocity_potential = vw.velocitypotential()
+    >>> psi, chi = vw.sfvp()
 
     Notes
     -----
-    The NumPy ``standard.VectorWind`` interface does not automatically reorder
-    latitude. If your data is south-to-north, reverse it first or use
-    :func:`skyborn.windspharm.tools.order_latdim`. The xarray interface handles
-    this reordering automatically.
+    With the Pure-Rust ``skybornspharm`` backend, C-order ``(..., nlat, nlon)``
+    arrays and south-to-north grids (via ``lat_order="S2N"`` or ``lat=...``)
+    execute directly without extra transposition or latitude copying.
     """
 
     def __init__(
@@ -108,7 +158,10 @@ class VectorWind:
         gridtype: GridType = "regular",
         rsphere: float = 6.3712e6,
         legfunc: LegFunc = "stored",
-        precision: Literal["auto", "single", "double"] = "auto",
+        precision: PrecisionMode = "auto",
+        layout: LayoutMode = "auto",
+        lat_order: LatOrderMode = "auto",
+        lat: Optional[np.ndarray] = None,
     ) -> None:
         """
         Initialize VectorWind instance with comprehensive data validation.
@@ -118,8 +171,7 @@ class VectorWind:
         dimensional requirements.
 
         Args:
-            u: Zonal wind component with latitude on axis 0 and longitude on
-                axis 1.
+            u: Zonal wind component with latitude/longitude axes.
             v: Meridional wind component with the same shape as ``u``.
             gridtype: Grid type - ``"regular"`` or ``"gaussian"``.
             rsphere: Sphere radius in meters.
@@ -128,14 +180,27 @@ class VectorWind:
             precision: Public output precision mode. ``"auto"`` preserves the
                 promoted input floating precision, ``"single"`` returns
                 float32 outputs, and ``"double"`` returns float64 outputs.
+            layout: Array axis ordering - ``"auto"`` (default, auto-detects
+                C-order ``(..., lat, lon)`` and legacy ``(lat, lon, ...)``),
+                ``"c"`` for ``(..., lat, lon)``, or ``"legacy"`` for ``(lat, lon, ...)``.
+            lat_order: Latitude ordering mode (``"north_to_south"``,
+                ``"south_to_north"``, ``"N2S"``, ``"S2N"``, or ``"auto"``).
+            lat: Optional 1D latitude array for south-to-north auto-detection.
 
         Raises:
             ValueError: If the input arrays fail shape, dimensional, or finite
                 value validation.
         """
-        # Step 1: Handle masked arrays and create copies
-        self._output_dtype = self._infer_output_dtype(u, v)
+        # Step 1: Handle masked arrays and resolve layout from original array metadata
+        raw_u = u if type(u) is np.ndarray else np.asarray(u)
+        self._output_dtype = self._infer_output_dtype(raw_u, v)
         self._precision = Spharmt._validate_precision(precision)
+        self._lat_order = lat_order
+        self._lat = None if lat is None else np.asarray(lat, dtype=np.float64)
+        norm_layout = self._normalize_layout(layout)
+        self._layout = self._resolve_layout(
+            raw_u.shape, raw_u.flags, norm_layout, gridtype, self._lat
+        )
         self.u = self._process_input_array(u, "u")
         self.v = self._process_input_array(v, "v")
 
@@ -146,8 +211,21 @@ class VectorWind:
         self._validate_dimensions()
 
         # Step 4: Initialize spherical harmonic transform
-        nlat, nlon = self.u.shape[0], self.u.shape[1]
-        self._initialize_spharmt(nlon, nlat, gridtype, rsphere, legfunc, precision)
+        nlat, nlon = self._horizontal_shape()
+        spharm_layout = (
+            "auto" if (norm_layout == "auto" and self.u.ndim == 2) else self._layout
+        )
+        self._initialize_spharmt(
+            nlon,
+            nlat,
+            gridtype,
+            rsphere,
+            legfunc,
+            precision,
+            layout=spharm_layout,
+            lat_order=self._lat_order,
+            lat=self._lat,
+        )
         self._setup_cached_arrays()
 
         # Step 5: Create method aliases for backward compatibility
@@ -161,21 +239,118 @@ class VectorWind:
         gridtype: GridType = "regular",
         rsphere: float = 6.3712e6,
         legfunc: LegFunc = "stored",
-        precision: Literal["auto", "single", "double"] = "auto",
+        precision: PrecisionMode = "auto",
+        layout: LayoutMode = "auto",
+        lat_order: LatOrderMode = "auto",
+        lat: Optional[np.ndarray] = None,
     ) -> "VectorWind":
         """Create an instance from validated wrapper-owned arrays."""
         self = cls.__new__(cls)
-        self._output_dtype = self._infer_output_dtype(u, v)
+        raw_u = u if type(u) is np.ndarray else np.asarray(u)
+        self._output_dtype = self._infer_output_dtype(raw_u, v)
         self._precision = Spharmt._validate_precision(precision)
+        self._lat_order = lat_order
+        self._lat = None if lat is None else np.asarray(lat, dtype=np.float64)
+        norm_layout = self._normalize_layout(layout)
+        self._layout = self._resolve_layout(
+            raw_u.shape, raw_u.flags, norm_layout, gridtype, self._lat
+        )
         self.u = self._process_input_array(u, "u", copy=False)
         self.v = self._process_input_array(v, "v", copy=False)
         self._validate_input_data()
         self._validate_dimensions()
-        nlat, nlon = self.u.shape[0], self.u.shape[1]
-        self._initialize_spharmt(nlon, nlat, gridtype, rsphere, legfunc, precision)
+        nlat, nlon = self._horizontal_shape()
+        spharm_layout = (
+            "auto" if (norm_layout == "auto" and self.u.ndim == 2) else self._layout
+        )
+        self._initialize_spharmt(
+            nlon,
+            nlat,
+            gridtype,
+            rsphere,
+            legfunc,
+            precision,
+            layout=spharm_layout,
+            lat_order=self._lat_order,
+            lat=self._lat,
+        )
         self._setup_cached_arrays()
         self._setup_method_aliases()
         return self
+
+    @staticmethod
+    def _normalize_layout(layout: str) -> str:
+        """Validate layout option."""
+        norm = _LAYOUT_ALIASES.get(layout) if type(layout) is str else None
+        if norm is None:
+            norm = _LAYOUT_ALIASES.get(str(layout).lower())
+        if norm is None:
+            raise ValueError(
+                f'layout must be "legacy", "c", or "auto", got "{layout}"'
+            )
+        return norm
+
+    @staticmethod
+    def _grid_pair_score(nlat: int, nlon: int, gridtype: str) -> int:
+        """Score how plausible a (nlat, nlon) pair is for a global spherical grid."""
+        is_gaussian = (
+            _GRIDTYPE_IS_GAUSSIAN.get(gridtype) if type(gridtype) is str else None
+        )
+        if is_gaussian is None:
+            is_gaussian = str(gridtype).lower() == "gaussian"
+        return _score_grid_pair(nlat, nlon, is_gaussian)
+
+    @classmethod
+    def _resolve_layout(
+        cls,
+        shape: Tuple[int, ...],
+        flags: Any,
+        layout: str,
+        gridtype: str,
+        lat: Optional[np.ndarray] = None,
+    ) -> str:
+        """Resolve 'auto' layout to concrete 'c' or 'legacy' axis order."""
+        norm = _LAYOUT_ALIASES.get(layout) if type(layout) is str else None
+        if norm is None:
+            norm = cls._normalize_layout(layout)
+        if norm != "auto":
+            return norm
+        if len(shape) <= 2:
+            return "c"
+
+        if lat is not None and lat.ndim == 1:
+            nlat_ref = lat.size
+            c_ok = shape[-2] == nlat_ref and shape[-2] >= 3 and shape[-1] >= 4
+            l_ok = shape[0] == nlat_ref and shape[0] >= 3 and shape[1] >= 4
+            if c_ok and not l_ok:
+                return "c"
+            if l_ok and not c_ok:
+                return "legacy"
+
+        is_gaussian = (
+            _GRIDTYPE_IS_GAUSSIAN.get(gridtype) if type(gridtype) is str else None
+        )
+        if is_gaussian is None:
+            is_gaussian = str(gridtype).lower() == "gaussian"
+
+        if flags is None:
+            f_only = False
+        else:
+            try:
+                f_only = bool(flags.f_contiguous and not flags.c_contiguous)
+            except AttributeError:
+                f_only = bool(
+                    getattr(flags, "f_contiguous", False)
+                    and not getattr(flags, "c_contiguous", True)
+                )
+
+        return _cached_resolve_auto_layout(shape, is_gaussian, f_only)
+
+    def _horizontal_shape(self) -> Tuple[int, int]:
+        """Return (nlat, nlon) according to configured layout."""
+        if getattr(self, "_layout", "legacy") == "c":
+            return int(self.u.shape[-2]), int(self.u.shape[-1])
+        return int(self.u.shape[0]), int(self.u.shape[1])
 
     # ------------------------------------------------------------------
     # Input processing, dtype handling, and validation
@@ -184,25 +359,44 @@ class VectorWind:
     @staticmethod
     def _infer_output_dtype(*arrays: ArrayLike) -> np.dtype:
         """Return the public output dtype for floating inputs."""
+        if len(arrays) == 2:
+            a0, a1 = arrays
+            if type(a0) is np.ndarray and type(a1) is np.ndarray:
+                d0, d1 = a0.dtype, a1.dtype
+                if d0 == _DTYPE_F32 and d1 == _DTYPE_F32:
+                    return _DTYPE_F32
+                if (d0 == _DTYPE_F64 or d1 == _DTYPE_F64) and (
+                    d0 == _DTYPE_F32 or d0 == _DTYPE_F64
+                ) and (d1 == _DTYPE_F32 or d1 == _DTYPE_F64):
+                    return _DTYPE_F64
+        elif len(arrays) == 1:
+            a0 = arrays[0]
+            if type(a0) is np.ndarray:
+                d0 = a0.dtype
+                if d0 == _DTYPE_F32:
+                    return _DTYPE_F32
+                if d0 == _DTYPE_F64:
+                    return _DTYPE_F64
+
         output_dtype = None
         for arr in arrays:
-            dtype = np.dtype(np.asarray(arr).dtype)
+            dtype = arr.dtype if type(arr) is np.ndarray else np.dtype(np.asarray(arr).dtype)
             if np.issubdtype(dtype, np.floating):
                 public_dtype = dtype
             else:
-                public_dtype = np.dtype(np.float64)
+                public_dtype = _DTYPE_F64
             output_dtype = (
                 public_dtype
                 if output_dtype is None
                 else np.result_type(output_dtype, public_dtype)
             )
-        return np.dtype(np.float64 if output_dtype is None else output_dtype)
+        return _DTYPE_F64 if output_dtype is None else output_dtype
 
     def _restore_output_dtype(
         self, data: np.ndarray, output_dtype: Optional[np.dtype] = None
     ) -> np.ndarray:
         """Cast grid-space public outputs back to the input precision."""
-        array = np.asarray(data)
+        array = data if type(data) is np.ndarray else np.asarray(data)
         precision = getattr(self, "_precision", "auto")
         if precision == "double":
             target_dtype = np.float64
@@ -234,13 +428,16 @@ class VectorWind:
         ndarray
             Processed numpy array
         """
+        if type(arr) is np.ndarray and (arr.dtype == _DTYPE_F32 or arr.dtype == _DTYPE_F64):
+            return arr.copy() if copy else arr
+
         try:
             # Handle masked arrays
             if hasattr(arr, "filled"):
                 masked = np.ma.asarray(arr)
                 dtype = masked.dtype
                 if not np.issubdtype(dtype, np.floating):
-                    dtype = np.dtype(np.float64)
+                    dtype = _DTYPE_F64
                 processed = np.ma.asarray(masked, dtype=dtype).filled(fill_value=np.nan)
                 if copy:
                     processed = processed.copy()
@@ -248,7 +445,7 @@ class VectorWind:
                 raw = np.asarray(arr)
                 dtype = np.dtype(raw.dtype)
                 if not np.issubdtype(dtype, np.floating):
-                    dtype = np.dtype(np.float64)
+                    dtype = _DTYPE_F64
                 processed = np.asarray(raw, dtype=dtype)
                 if copy:
                     processed = processed.copy()
@@ -336,7 +533,7 @@ class VectorWind:
             )
 
         # Check minimum grid size
-        nlat, nlon = self.u.shape[:2]
+        nlat, nlon = self._horizontal_shape()
         if nlat < 3 or nlon < 4:
             raise ValueError(
                 f"Grid too small for spherical harmonic analysis. "
@@ -366,6 +563,9 @@ class VectorWind:
         rsphere: float,
         legfunc: str,
         precision: Literal["auto", "single", "double"] = "auto",
+        layout: Literal["legacy", "c", "auto"] = "legacy",
+        lat_order: str = "auto",
+        lat: Optional[np.ndarray] = None,
     ) -> None:
         """
         Initialize spherical harmonic transform object with validation.
@@ -409,14 +609,23 @@ class VectorWind:
 
         try:
             # Create spherical harmonic transform object
-            self.s = Spharmt(
-                nlon=nlon,
-                nlat=nlat,
-                gridtype=self.gridtype,
-                rsphere=rsphere,
-                legfunc=legfunc,
-                precision=precision,
-            )
+            spharm_kwargs = {
+                "nlon": nlon,
+                "nlat": nlat,
+                "gridtype": self.gridtype,
+                "rsphere": rsphere,
+                "legfunc": legfunc,
+                "precision": precision,
+            }
+            if hasattr(spharm_mod, "SpharmTransform"):
+                spharm_kwargs["layout"] = layout
+                spharm_kwargs["lat_order"] = lat_order
+                spharm_kwargs["lat"] = lat
+            self.s = Spharmt(**spharm_kwargs)
+            self.precision = getattr(self.s, "precision", self._precision)
+            self.layout = self._layout
+            self.lat_order = getattr(self.s, "lat_order", self._lat_order)
+            self.south_to_north = bool(getattr(self.s, "south_to_north", False))
         except Exception as e:
             # Provide more informative error messages
             if "invalid input dimensions" in str(e).lower():
@@ -453,7 +662,12 @@ class VectorWind:
 
     def _latitude_values(self) -> np.ndarray:
         """Return latitude coordinates for this wind grid."""
-        key = (self.gridtype, self.s.nlat)
+        explicit_lat = getattr(self, "_lat", None)
+        if explicit_lat is not None:
+            return explicit_lat
+
+        s2n = bool(getattr(getattr(self, "s", None), "south_to_north", False))
+        key = (self.gridtype, self.s.nlat, s2n) if s2n else (self.gridtype, self.s.nlat)
         cache = getattr(self, "_latitude_cache", None)
         if cache is None:
             cache = {}
@@ -472,6 +686,9 @@ class VectorWind:
             dlat = 180.0 / nlat
             lat = np.arange(90 - dlat / 2.0, -90, -dlat)
 
+        if s2n:
+            lat = lat[::-1].copy()
+
         cache[key] = np.asarray(lat)
         return cache[key]
 
@@ -488,7 +705,8 @@ class VectorWind:
             raise ValueError(f"invalid value for omega: {omega!r}")
 
         output_dtype = self._output_dtype if dtype is None else np.dtype(dtype)
-        key = (self.gridtype, self.s.nlat, omega_value, output_dtype.str)
+        s2n = bool(getattr(getattr(self, "s", None), "south_to_north", False))
+        key = (self.gridtype, self.s.nlat, omega_value, output_dtype.str, s2n)
         cache = getattr(self, "_coriolis_cache", None)
         if cache is None:
             cache = {}
@@ -522,8 +740,14 @@ class VectorWind:
         self, coriolis: np.ndarray, materialize: bool
     ) -> np.ndarray:
         """Broadcast latitude-only Coriolis values to the wind field shape."""
-        indices = [slice(None)] + [np.newaxis] * (len(self.u.shape) - 1)
-        broadcast = np.broadcast_to(coriolis[tuple(indices)], self.u.shape)
+        if getattr(self, "_layout", "legacy") == "c":
+            indices = (np.newaxis,) * (len(self.u.shape) - 2) + (
+                slice(None),
+                np.newaxis,
+            )
+        else:
+            indices = (slice(None),) + (np.newaxis,) * (len(self.u.shape) - 1)
+        broadcast = np.broadcast_to(coriolis[indices], self.u.shape)
         if materialize:
             return np.array(broadcast, copy=True)
         return broadcast
@@ -540,7 +764,8 @@ class VectorWind:
         except (TypeError, ValueError):
             raise ValueError(f"invalid value for omega: {omega!r}")
         ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
-        key = (self.gridtype, self.s.nlat, self.s.nlon, omega_value, ntrunc)
+        s2n = bool(getattr(self.s, "south_to_north", False))
+        key = (self.gridtype, self.s.nlat, self.s.nlon, omega_value, ntrunc, s2n)
         cache = getattr(self, "_planetary_vorticity_spec_cache", None)
         if cache is None:
             cache = {}
@@ -556,6 +781,8 @@ class VectorWind:
         if spectral_ndim <= 0:
             return fspec
 
+        if getattr(self, "_layout", "legacy") == "c":
+            return fspec[(np.newaxis,) * spectral_ndim + (slice(None),)]
         return fspec[(slice(None),) + (np.newaxis,) * spectral_ndim]
 
     def _gradient_components(
@@ -580,20 +807,27 @@ class VectorWind:
     def _vector_analysis_layout_inputs(
         self,
     ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, ...]]:
-        """Return one cached Fortran-ready flattened wind-field pair."""
+        """Return one cached C-contiguous (nt, nlat, nlon) wind-field pair."""
         cache = getattr(self, "_vector_analysis_layout_cache", None)
         if cache is not None:
             return cache
 
+        if hasattr(self.s, "_core"):
+            _, _, layout_u, layout_v, extra_shape = self.s._prepare_paired_grid_inputs(
+                self.u, self.v, "vector wind analysis"
+            )
+            cache = (layout_u, layout_v, extra_shape)
+            self._vector_analysis_layout_cache = cache
+            return cache
+
+        # Compatibility path for legacy Fortran-backed skybornspharm (<0.2.0)
         if self.u.ndim == 2:
             extra_shape: Tuple[int, ...] = ()
             layout_u = np.asfortranarray(np.expand_dims(self.u, 2), dtype=np.float32)
             layout_v = np.asfortranarray(np.expand_dims(self.v, 2), dtype=np.float32)
         else:
-            extra_shape = tuple(self.u.shape[2:])
-            nt = int(np.prod(extra_shape, dtype=int))
-            # Preserve the existing C-order flatten semantics, then convert once
-            # to a Fortran-contiguous 3D layout for repeated vector analysis.
+            extra_shape = self.u.shape[2:]
+            nt = math.prod(extra_shape)
             layout_u = np.asfortranarray(
                 self.u.reshape(self.u.shape[0], self.u.shape[1], nt),
                 dtype=np.float32,
@@ -611,6 +845,42 @@ class VectorWind:
         self, truncation: Optional[int] = None, component: Optional[str] = None
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Return cached-layout vector-analysis spectra for wind-derived diagnostics."""
+        if component not in (None, "vrt", "div"):
+            raise ValueError(f"unsupported component: {component!r}")
+
+        if hasattr(self.s, "_core"):
+            layout_u, layout_v, batch_shape = self._vector_analysis_layout_inputs()
+            ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
+            resolved_layout = (
+                "c" if getattr(self, "_layout", "legacy") == "c" else "legacy"
+            )
+            s2n = bool(getattr(self.s, "south_to_north", False))
+            if component is None:
+                vrt_2d, div_2d = self.s._core.getvrtdivspec(
+                    layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+                )
+                return (
+                    self.s._restore_spectral_output(
+                        vrt_2d, resolved_layout, batch_shape
+                    ),
+                    self.s._restore_spectral_output(
+                        div_2d, resolved_layout, batch_shape
+                    ),
+                )
+            if component == "vrt":
+                vrt_2d = self.s._core.getvrtspec(
+                    layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+                )
+                return self.s._restore_spectral_output(
+                    vrt_2d, resolved_layout, batch_shape
+                )
+            div_2d = self.s._core.getdivspec(
+                layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+            )
+            return self.s._restore_spectral_output(
+                div_2d, resolved_layout, batch_shape
+            )
+
         if component is None and not hasattr(
             self.s, "_analyze_vector_harmonics_flattened"
         ):
@@ -624,7 +894,15 @@ class VectorWind:
         ):
             return self.s.getdivspec(self.u, self.v, ntrunc=truncation)
 
+        # Compatibility path for legacy Fortran-backed skybornspharm (<0.2.0)
         layout_u, layout_v, extra_shape = self._vector_analysis_layout_inputs()
+        spherepack = getattr(spharm_mod, "_spherepack", None)
+        if spherepack is None:
+            if component is None:
+                return self.s.getvrtdivspec(self.u, self.v, ntrunc=truncation)
+            if component == "vrt":
+                return self.s.getvrtspec(self.u, self.v, ntrunc=truncation)
+            return self.s.getdivspec(self.u, self.v, ntrunc=truncation)
 
         if component is None:
             br, bi, cr, ci, _, ntrunc = self.s._analyze_vector_harmonics_flattened(
@@ -634,7 +912,7 @@ class VectorWind:
                 truncation,
                 "vector wind analysis",
             )
-            vrtspec, divspec = spharm_mod._spherepack.twodtooned_vrtdiv(
+            vrtspec, divspec = spherepack.twodtooned_vrtdiv(
                 br, bi, cr, ci, ntrunc, self.s.rsphere
             )
             return (
@@ -653,15 +931,13 @@ class VectorWind:
             )
         )
         if component == "vrt":
-            dataspec = spharm_mod._spherepack.twodtooned_vrt(
-                coeff_r, coeff_i, ntrunc, self.s.rsphere
-            )
-        elif component == "div":
-            dataspec = spharm_mod._spherepack.twodtooned_div(
+            dataspec = spherepack.twodtooned_vrt(
                 coeff_r, coeff_i, ntrunc, self.s.rsphere
             )
         else:
-            raise ValueError(f"unsupported component: {component!r}")
+            dataspec = spherepack.twodtooned_div(
+                coeff_r, coeff_i, ntrunc, self.s.rsphere
+            )
 
         return self.s._restore_spectral_shape(dataspec, extra_shape)
 
@@ -679,7 +955,7 @@ class VectorWind:
         dict
             Dictionary containing grid information
         """
-        nlat, nlon = self.u.shape[:2]
+        nlat, nlon = self._horizontal_shape()
         return {
             "gridtype": self.gridtype,
             "nlat": nlat,

@@ -120,16 +120,12 @@ class VectorWind:
         lat, lat_dim = _find_latitude_coordinate(u)
         lon, lon_dim = _find_longitude_coordinate(u)
 
-        # Ensure north-to-south latitude ordering
-        if lat.values[0] < lat.values[1]:
-            u = _reverse(u, lat_dim)
-            v = _reverse(v, lat_dim)
-            lat, lat_dim = _find_latitude_coordinate(u)
+        lat_values = np.asarray(lat.values)
+        is_south_to_north = bool(lat_values[0] < lat_values[-1])
 
-        # Determine grid type, unless the caller needs to override detection for
-        # known global grids with latitude conventions outside our strict checks.
+        # Determine grid type from monotonic global latitudes (N2S or S2N)
         if gridtype is None:
-            gridtype = inspect_gridtype(lat.values)
+            gridtype = inspect_gridtype(lat_values)
         else:
             gridtype = gridtype.lower()
             if gridtype not in ("regular", "gaussian"):
@@ -137,35 +133,74 @@ class VectorWind:
                     f"Invalid grid type: '{gridtype}'. Must be 'regular' or 'gaussian'"
                 )
 
-        # Prepare data for standard API
-        apiorder, _ = get_apiorder(u.ndim, lat_dim, lon_dim)
-        apiorder = [u.dims[i] for i in apiorder]
-
-        # Store original structure for output reconstruction
+        # Store original dimension order for output reconstruction
         self._reorder = u.dims
 
-        # Reorder dimensions and prepare data
-        u = u.transpose(*apiorder)
-        v = v.transpose(*apiorder)
+        use_c_layout = hasattr(standard.spharm_mod, "SpharmTransform")
+        if use_c_layout:
+            trailing_lat_lon = lat_dim == u.ndim - 2 and lon_dim == u.ndim - 1
+            if trailing_lat_lon:
+                self._needs_transpose = False
+            else:
+                self._needs_transpose = True
+                c_order = [
+                    dim
+                    for idx, dim in enumerate(u.dims)
+                    if idx not in (lat_dim, lon_dim)
+                ] + [u.dims[lat_dim], u.dims[lon_dim]]
+                u = u.transpose(*c_order)
+                v = v.transpose(*c_order)
 
-        # Store shape and coordinates for reconstruction
-        self._ishape = u.shape
-        self._coords = [u.coords[name] for name in u.dims]
+            self._ishape = u.shape
+            self._coords = [u.coords[name] for name in u.dims]
+            u_data = u.values
+            v_data = v.values
+            self._u_component_dtype = standard.VectorWind._infer_output_dtype(u_data)
+            self._v_component_dtype = standard.VectorWind._infer_output_dtype(v_data)
 
-        # The standard API now accepts (lat, lon, *extra_dims) directly.
-        u_data = u.values
-        v_data = v.values
-        self._u_component_dtype = standard.VectorWind._infer_output_dtype(u_data)
-        self._v_component_dtype = standard.VectorWind._infer_output_dtype(v_data)
+            self._api = standard.VectorWind._from_owned_input(
+                u_data,
+                v_data,
+                gridtype=gridtype,
+                rsphere=rsphere,
+                legfunc=legfunc,
+                precision=precision,
+                layout="c",
+                lat=lat_values,
+            )
+        else:
+            # Legacy fallback for older skybornspharm (<0.2.0)
+            if is_south_to_north:
+                u = _reverse(u, lat_dim)
+                v = _reverse(v, lat_dim)
+                lat, lat_dim = _find_latitude_coordinate(u)
+            apiorder, _ = get_apiorder(u.ndim, lat_dim, lon_dim)
+            apiorder = [u.dims[i] for i in apiorder]
+            self._needs_transpose = tuple(apiorder) != u.dims
+            u = u.transpose(*apiorder)
+            v = v.transpose(*apiorder)
+            self._ishape = u.shape
+            self._coords = [u.coords[name] for name in u.dims]
+            u_data = u.values
+            v_data = v.values
+            self._u_component_dtype = standard.VectorWind._infer_output_dtype(u_data)
+            self._v_component_dtype = standard.VectorWind._infer_output_dtype(v_data)
+            self._api = standard.VectorWind._from_owned_input(
+                u_data,
+                v_data,
+                gridtype=gridtype,
+                rsphere=rsphere,
+                legfunc=legfunc,
+                precision=precision,
+            )
 
-        self._api = standard.VectorWind._from_owned_input(
-            u_data,
-            v_data,
-            gridtype=gridtype,
-            rsphere=rsphere,
-            legfunc=legfunc,
-            precision=precision,
-        )
+        self.gridtype = self._api.gridtype
+        self.rsphere = self._api.rsphere
+        self.legfunc = self._api.legfunc
+        self.precision = getattr(self._api, "precision", precision)
+        self.s = self._api.s
+        self.rotationalcomponent = self.nondivergentcomponent
+        self.divergentcomponent = self.irrotationalcomponent
 
     def _validate_coordinates(self, u: DataArray, v: DataArray) -> None:
         """
@@ -225,14 +260,17 @@ class VectorWind:
         DataArray
             Properly formatted DataArray with coordinates and metadata
         """
-        # Reshape to original structure
-        data = data.reshape(self._ishape)
+        # Reshape to original structure when needed
+        data_arr = np.asarray(data)
+        if data_arr.shape != self._ishape:
+            data_arr = data_arr.reshape(self._ishape)
 
         # Create DataArray with coordinates
-        result = xr.DataArray(data, coords=self._coords, name=name)
+        result = xr.DataArray(data_arr, coords=self._coords, name=name)
 
-        # Restore original dimension order
-        result = result.transpose(*self._reorder)
+        # Restore original dimension order only when input axes were transposed
+        if getattr(self, "_needs_transpose", True):
+            result = result.transpose(*self._reorder)
 
         # Set attributes
         for attr, value in attributes.items():
@@ -459,7 +497,9 @@ class VectorWind:
             long_name="planetary_vorticity",
         )
 
-    def absolutevorticity(self, omega=None, truncation=None):
+    def absolutevorticity(
+        self, omega: Optional[float] = None, truncation: Optional[int] = None
+    ) -> DataArray:
         """Absolute vorticity (sum of relative and planetary vorticity).
 
         **Optional arguments:**
@@ -485,13 +525,13 @@ class VectorWind:
 
         Compute absolute vorticity::
 
-            avrt = w.absolutevorticity()
+            avrt = vw.absolutevorticity()
 
         Compute absolute vorticity and apply spectral truncation at
         triangular T13, also override the default value for Earth's
         angular velocity::
 
-            avrt = w.absolutevorticity(omega=7.2921150, truncation=13)
+            avrt = vw.absolutevorticity(omega=7.2921150e-5, truncation=13)
 
         """
         avrt = self._api.absolutevorticity(omega=omega, truncation=truncation)
@@ -550,7 +590,7 @@ class VectorWind:
 
         return sf_da, vp_da
 
-    def streamfunction(self, truncation=None):
+    def streamfunction(self, truncation: Optional[int] = None) -> DataArray:
         """Streamfunction.
 
         **Optional argument:**
@@ -572,12 +612,12 @@ class VectorWind:
 
         Compute streamfunction::
 
-            sf = w.streamfunction()
+            sf = vw.streamfunction()
 
         Compute streamfunction and apply spectral truncation at
         triangular T13::
 
-            sfT13 = w.streamfunction(truncation=13)
+            sfT13 = vw.streamfunction(truncation=13)
 
         """
         sf = self._api.streamfunction(truncation=truncation)
@@ -590,7 +630,7 @@ class VectorWind:
         )
         return sf
 
-    def velocitypotential(self, truncation=None):
+    def velocitypotential(self, truncation: Optional[int] = None) -> DataArray:
         """Velocity potential.
 
         **Optional argument:**
@@ -612,12 +652,12 @@ class VectorWind:
 
         Compute velocity potential::
 
-            vp = w.velocity potential()
+            vp = vw.velocitypotential()
 
         Compute velocity potential and apply spectral truncation at
         triangular T13::
 
-            vpT13 = w.velocity potential(truncation=13)
+            vpT13 = vw.velocitypotential(truncation=13)
 
         """
         vp = self._api.velocitypotential(truncation=truncation)
@@ -630,7 +670,9 @@ class VectorWind:
         )
         return vp
 
-    def helmholtz(self, truncation=None):
+    def helmholtz(
+        self, truncation: Optional[int] = None
+    ) -> Tuple[DataArray, DataArray, DataArray, DataArray]:
         """Irrotational and non-divergent components of the vector wind.
 
         **Optional argument:**
@@ -655,12 +697,12 @@ class VectorWind:
         Compute the irrotational and non-divergent components of the
         vector wind::
 
-            uchi, vchi, upsi, vpsi = w.helmholtz()
+            uchi, vchi, upsi, vpsi = vw.helmholtz()
 
         Compute the irrotational and non-divergent components of the
         vector wind and apply spectral truncation at triangular T13::
 
-            uchiT13, vchiT13, upsiT13, vpsiT13 = w.helmholtz(truncation=13)
+            uchiT13, vchiT13, upsiT13, vpsiT13 = vw.helmholtz(truncation=13)
 
         """
         uchi, vchi, upsi, vpsi = self._api.helmholtz(truncation=truncation)
@@ -678,7 +720,9 @@ class VectorWind:
         )
         return uchi, vchi, upsi, vpsi
 
-    def irrotationalcomponent(self, truncation=None):
+    def irrotationalcomponent(
+        self, truncation: Optional[int] = None
+    ) -> Tuple[DataArray, DataArray]:
         """Irrotational (divergent) component of the vector wind.
 
         .. note::
@@ -706,12 +750,12 @@ class VectorWind:
 
         Compute the irrotational component of the vector wind::
 
-            uchi, vchi = w.irrotationalcomponent()
+            uchi, vchi = vw.irrotationalcomponent()
 
         Compute the irrotational component of the vector wind and apply
         spectral truncation at triangular T13::
 
-            uchiT13, vchiT13 = w.irrotationalcomponent(truncation=13)
+            uchiT13, vchiT13 = vw.irrotationalcomponent(truncation=13)
 
         """
         uchi, vchi = self._api.irrotationalcomponent(truncation=truncation)
@@ -723,7 +767,9 @@ class VectorWind:
         )
         return uchi, vchi
 
-    def nondivergentcomponent(self, truncation=None):
+    def nondivergentcomponent(
+        self, truncation: Optional[int] = None
+    ) -> Tuple[DataArray, DataArray]:
         """Non-divergent (rotational) component of the vector wind.
 
         .. note::
@@ -751,12 +797,12 @@ class VectorWind:
 
         Compute the non-divergent component of the vector wind::
 
-            upsi, vpsi = w.nondivergentcomponent()
+            upsi, vpsi = vw.nondivergentcomponent()
 
         Compute the non-divergent component of the vector wind and apply
         spectral truncation at triangular T13::
 
-            upsiT13, vpsiT13 = w.nondivergentcomponent(truncation=13)
+            upsiT13, vpsiT13 = vw.nondivergentcomponent(truncation=13)
 
         """
         upsi, vpsi = self._api.nondivergentcomponent(truncation=truncation)
@@ -805,17 +851,32 @@ class VectorWind:
         lat, lat_dim = _find_latitude_coordinate(chi)
         lon, lon_dim = _find_longitude_coordinate(chi)
 
-        # Ensure north-to-south latitude ordering
-        if lat.values[0] < lat.values[1]:
+        target_s2n = bool(getattr(self._api.s, "south_to_north", False))
+        chi_s2n = bool(lat.values[0] < lat.values[-1])
+        if chi_s2n != target_s2n:
             chi = _reverse(chi, lat_dim)
             lat, lat_dim = _find_latitude_coordinate(chi)
 
-        # Reorder for API compatibility
-        apiorder, _ = get_apiorder(chi.ndim, lat_dim, lon_dim)
-        apiorder = [chi.dims[i] for i in apiorder]
         reorder = chi.dims
+        use_c_layout = getattr(self._api, "_layout", "legacy") == "c"
+        if use_c_layout:
+            needs_transpose = not (
+                lat_dim == chi.ndim - 2 and lon_dim == chi.ndim - 1
+            )
+            if needs_transpose:
+                c_order = [
+                    dim
+                    for idx, dim in enumerate(chi.dims)
+                    if idx not in (lat_dim, lon_dim)
+                ] + [chi.dims[lat_dim], chi.dims[lon_dim]]
+                chi = chi.transpose(*c_order)
+        else:
+            apiorder, _ = get_apiorder(chi.ndim, lat_dim, lon_dim)
+            apiorder = [chi.dims[i] for i in apiorder]
+            needs_transpose = tuple(apiorder) != chi.dims
+            if needs_transpose:
+                chi = chi.transpose(*apiorder)
 
-        chi = chi.transpose(*apiorder)
         ishape = chi.shape
         coords = [chi.coords[n] for n in chi.dims]
 
@@ -823,22 +884,27 @@ class VectorWind:
         u_grad, v_grad = self._api.gradient(chi.values, truncation=truncation)
 
         # Reshape and create DataArrays
-        u_grad = u_grad.reshape(ishape)
-        v_grad = v_grad.reshape(ishape)
+        u_grad_arr = np.asarray(u_grad)
+        v_grad_arr = np.asarray(v_grad)
+        if u_grad_arr.shape != ishape:
+            u_grad_arr = u_grad_arr.reshape(ishape)
+        if v_grad_arr.shape != ishape:
+            v_grad_arr = v_grad_arr.reshape(ishape)
 
         u_name = f"zonal_gradient_of_{name}"
         v_name = f"meridional_gradient_of_{name}"
 
         u_da = xr.DataArray(
-            u_grad, coords=coords, name=u_name, attrs={"long_name": u_name}
+            u_grad_arr, coords=coords, name=u_name, attrs={"long_name": u_name}
         )
         v_da = xr.DataArray(
-            v_grad, coords=coords, name=v_name, attrs={"long_name": v_name}
+            v_grad_arr, coords=coords, name=v_name, attrs={"long_name": v_name}
         )
 
-        # Restore original dimension order
-        u_da = u_da.transpose(*reorder)
-        v_da = v_da.transpose(*reorder)
+        # Restore original dimension order if transposed
+        if needs_transpose:
+            u_da = u_da.transpose(*reorder)
+            v_da = v_da.transpose(*reorder)
 
         return u_da, v_da
 
@@ -950,42 +1016,63 @@ class VectorWind:
         lat, lat_dim = _find_latitude_coordinate(field)
         lon, lon_dim = _find_longitude_coordinate(field)
 
-        # Ensure north-to-south latitude ordering
-        if lat.values[0] < lat.values[1]:
+        target_s2n = bool(getattr(self._api.s, "south_to_north", False))
+        field_s2n = bool(lat.values[0] < lat.values[-1])
+        if field_s2n != target_s2n:
             field = _reverse(field, lat_dim)
             lat, lat_dim = _find_latitude_coordinate(field)
 
-        # Reorder for API compatibility
-        apiorder, _ = get_apiorder(field.ndim, lat_dim, lon_dim)
-        apiorder = [field.dims[i] for i in apiorder]
         reorder = field.dims
+        use_c_layout = getattr(self._api, "_layout", "legacy") == "c"
+        if use_c_layout:
+            needs_transpose = not (
+                lat_dim == field.ndim - 2 and lon_dim == field.ndim - 1
+            )
+            if needs_transpose:
+                c_order = [
+                    dim
+                    for idx, dim in enumerate(field.dims)
+                    if idx not in (lat_dim, lon_dim)
+                ] + [field.dims[lat_dim], field.dims[lon_dim]]
+                field = field.transpose(*c_order)
+        else:
+            apiorder, _ = get_apiorder(field.ndim, lat_dim, lon_dim)
+            apiorder = [field.dims[i] for i in apiorder]
+            needs_transpose = tuple(apiorder) != field.dims
+            if needs_transpose:
+                field = field.transpose(*apiorder)
 
-        field = field.transpose(*apiorder)
         ishape = field.shape
         coords = [field.coords[n] for n in field.dims]
 
         # Apply truncation using standard API
-        field_trunc = self._api.truncate(field.values, truncation=truncation)
+        field_trunc = np.asarray(
+            self._api.truncate(field.values, truncation=truncation)
+        )
+        if field_trunc.shape != ishape:
+            field_trunc = field_trunc.reshape(ishape)
 
         # Restore dimension order without coercing the computed result into the
         # input array's dtype.
-        field = xr.DataArray(
-            field_trunc.reshape(ishape),
+        result = xr.DataArray(
+            field_trunc,
             coords=coords,
             name=field.name,
             attrs=field.attrs,
-        ).transpose(*reorder)
+        )
+        if needs_transpose:
+            result = result.transpose(*reorder)
 
-        return field
+        return result
 
 
 class ReducedVectorWind:
     """
     Xarray interface for packed reduced-Gaussian vector wind analysis.
 
-    The first dimension of ``u`` and ``v`` is interpreted as the packed
-    reduced-Gaussian point dimension and must have length ``sum(pl)``. Any
-    remaining dimensions are carried through unchanged.
+    Supports packed reduced-Gaussian point dimensions of length ``sum(pl)`` at
+    any axis position, preferring C-order ``(..., sum(pl))`` or legacy
+    ``(sum(pl), ...)`` without intermediate transposition.
     """
 
     def __init__(
@@ -996,6 +1083,8 @@ class ReducedVectorWind:
         rsphere: float = 6.3712e6,
         legfunc: LegFunc = "stored",
         precision: Literal["auto", "single", "double"] = "auto",
+        lat_order: str = "auto",
+        lat: Optional[Any] = None,
     ) -> None:
         if not isinstance(u, xr.DataArray):
             raise TypeError(f"u must be xarray.DataArray, got {type(u).__name__}")
@@ -1004,6 +1093,39 @@ class ReducedVectorWind:
 
         self._validate_coordinates(u, v)
         self._reorder = u.dims
+        pl_arr = reduced.ReducedVectorWind._validate_pl(pl)
+        npoints = int(pl_arr.sum())
+        if u.ndim <= 1:
+            self._needs_transpose = False
+            target_layout = "c"
+        elif u.shape[-1] == npoints and u.shape[0] != npoints:
+            self._needs_transpose = False
+            target_layout = "c"
+        elif u.shape[0] == npoints and u.shape[-1] != npoints:
+            self._needs_transpose = False
+            target_layout = "legacy"
+        elif npoints in u.shape:
+            if u.shape[-1] == npoints and u.shape[0] == npoints:
+                self._needs_transpose = False
+                u_flags = u.values.flags
+                target_layout = (
+                    "legacy"
+                    if u_flags.f_contiguous and not u_flags.c_contiguous
+                    else "c"
+                )
+            else:
+                point_dim = u.shape.index(npoints)
+                self._needs_transpose = True
+                c_order = [
+                    dim for idx, dim in enumerate(u.dims) if idx != point_dim
+                ] + [u.dims[point_dim]]
+                u = u.transpose(*c_order)
+                v = v.transpose(*c_order)
+                target_layout = "c"
+        else:
+            self._needs_transpose = False
+            target_layout = "auto"
+
         self._ishape = u.shape
         self._coords = [u.coords[name] for name in u.dims]
         self._u_component_dtype = reduced.ReducedVectorWind._infer_output_dtype(
@@ -1016,16 +1138,22 @@ class ReducedVectorWind:
         self._api = reduced.ReducedVectorWind(
             u.values,
             v.values,
-            pl,
+            pl_arr,
             rsphere=rsphere,
             legfunc=legfunc,
             precision=precision,
+            layout=target_layout,
+            lat_order=lat_order,
+            lat=lat,
         )
         self.pl = self._api.pl
         self.gridtype = self._api.gridtype
         self.rsphere = self._api.rsphere
         self.legfunc = self._api.legfunc
+        self.precision = getattr(self._api, "precision", precision)
         self.s = self._api.s
+        self.rotationalcomponent = self.nondivergentcomponent
+        self.divergentcomponent = self.irrotationalcomponent
 
     def _validate_coordinates(self, u: DataArray, v: DataArray) -> None:
         if u.dims != v.dims:
@@ -1052,7 +1180,8 @@ class ReducedVectorWind:
         result = xr.DataArray(
             np.asarray(data).reshape(self._ishape), coords=self._coords, name=name
         )
-        result = result.transpose(*self._reorder)
+        if getattr(self, "_needs_transpose", True):
+            result = result.transpose(*self._reorder)
         for attr, value in attributes.items():
             result.attrs[attr] = value
         return result
@@ -1278,6 +1407,9 @@ class ReducedVectorWind:
                 f"Scalar field must be xarray.DataArray, got {type(chi).__name__}"
             )
         name = chi.name or "field"
+        api_dims = tuple(c.name for c in self._coords)
+        if chi.dims != api_dims and set(chi.dims) == set(api_dims):
+            chi = chi.transpose(*api_dims)
         u_grad, v_grad = self._api.gradient(chi.values, truncation=truncation)
         return (
             self._metadata(
@@ -1298,6 +1430,9 @@ class ReducedVectorWind:
             raise TypeError(
                 f"Field must be xarray.DataArray, got {type(field).__name__}"
             )
+        api_dims = tuple(c.name for c in self._coords)
+        if field.dims != api_dims and set(field.dims) == set(api_dims):
+            field = field.transpose(*api_dims)
         truncated = self._api.truncate(field.values, truncation=truncation)
         result = xr.DataArray(
             truncated.reshape(self._ishape),
@@ -1305,7 +1440,9 @@ class ReducedVectorWind:
             name=field.name,
             attrs=field.attrs,
         )
-        return result.transpose(*self._reorder)
+        if getattr(self, "_needs_transpose", True):
+            result = result.transpose(*self._reorder)
+        return result
 
     def rossbywavesource(
         self, truncation: Optional[int] = None, omega: Optional[float] = None

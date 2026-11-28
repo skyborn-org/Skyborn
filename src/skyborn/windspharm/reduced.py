@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Literal, Optional, Tuple, Union
 
 import numpy as np
 
 from skyborn.spharm import ReducedGaussianSpharmt, gaussian_lats_wts
 
 ArrayLike = Union[np.ndarray, np.ma.MaskedArray]
+LegFunc = Literal["stored", "computed"]
+PrecisionMode = Literal["auto", "single", "float32", "double", "float64"]
+LayoutMode = Literal["legacy", "c", "auto"]
+LatOrderMode = Literal["north_to_south", "south_to_north", "N2S", "S2N", "auto"]
 
 
 class ReducedVectorWind:
@@ -19,7 +23,7 @@ class ReducedVectorWind:
     ----------
     u, v:
         Packed zonal and meridional wind components with shape
-        ``(sum(pl), ...)``.
+        ``(..., sum(pl))`` (C-order, zero-copy) or ``(sum(pl), ...)`` (legacy).
     pl:
         Reduced Gaussian row lengths, ordered north-to-south.
     rsphere:
@@ -28,8 +32,16 @@ class ReducedVectorWind:
         Legendre function mode passed to grouped Gaussian ``Spharmt`` backends.
     precision:
         Public output precision mode. ``"auto"`` preserves the promoted input
-        floating precision, ``"single"`` returns float32 outputs, and
-        ``"double"`` returns float64 outputs.
+        floating precision, ``"single"``/``"float32"`` returns float32 outputs,
+        and ``"double"``/``"float64"`` returns float64 outputs.
+    layout:
+        Array axis ordering: ``"auto"`` (default, auto-detects C-order
+        ``(..., sum(pl))`` and legacy ``(sum(pl), ...)``), ``"c"``, or ``"legacy"``.
+    lat_order:
+        Latitude direction mode (``"auto"``, ``"N2S"``, ``"S2N"``,
+        ``"north_to_south"``, or ``"south_to_north"``).
+    lat:
+        Optional 1D latitude array for south-to-north auto-detection.
 
     Attributes
     ----------
@@ -45,6 +57,12 @@ class ReducedVectorWind:
         Legendre function handling mode used by the underlying transform.
     precision:
         Public output precision mode.
+    layout:
+        Resolved array layout mode (``"c"`` or ``"legacy"``).
+    lat_order:
+        Normalized latitude ordering mode.
+    south_to_north:
+        Whether input/output rings are ordered south-to-north.
     s:
         Underlying :class:`skyborn.spharm.ReducedGaussianSpharmt` instance.
     """
@@ -55,14 +73,17 @@ class ReducedVectorWind:
         v: ArrayLike,
         pl: ArrayLike,
         rsphere: float = 6.3712e6,
-        legfunc: str = "stored",
-        precision: str = "auto",
+        legfunc: LegFunc = "stored",
+        precision: PrecisionMode = "auto",
+        layout: LayoutMode = "auto",
+        lat_order: LatOrderMode = "auto",
+        lat: Optional[np.ndarray] = None,
     ) -> None:
         """
         Create a reduced-Gaussian vector wind analysis wrapper.
 
         Args:
-            u: Packed zonal wind component with shape ``(sum(pl), ...)``.
+            u: Packed zonal wind component.
             v: Packed meridional wind component with the same shape as ``u``.
             pl: Reduced Gaussian row lengths ordered north-to-south.
             rsphere: Sphere radius in meters.
@@ -71,32 +92,52 @@ class ReducedVectorWind:
             precision: Public output precision mode. ``"auto"`` preserves the
                 promoted input floating precision, ``"single"`` returns
                 float32 outputs, and ``"double"`` returns float64 outputs.
+            layout: Array axis convention (``"auto"``, ``"c"``, or ``"legacy"``).
+            lat_order: Latitude ordering mode (``"auto"``, ``"N2S"``, or ``"S2N"``).
+            lat: Optional 1D latitude coordinate array for S2N auto-detection.
 
         Raises:
             ValueError: If ``u``, ``v``, or ``pl`` fails validation.
         """
+        raw_u = np.asarray(u)
         self.pl = self._validate_pl(pl)
         self._output_dtype = self._infer_output_dtype(u, v)
         self._precision = ReducedGaussianSpharmt._validate_precision(precision)
+        self._lat = None if lat is None else np.asarray(lat, dtype=np.float64)
         self.u = self._process_input_array(u, "u")
         self.v = self._process_input_array(v, "v")
-        self._validate_input_data()
-        self._extra_shape = tuple(self.u.shape[1:])
+        self._layout, self._extra_shape = self._validate_input_data(
+            layout, raw_u.flags
+        )
         self._nt = (
             int(np.prod(self._extra_shape, dtype=int)) if self._extra_shape else 1
         )
-        self._u_backend = self._normalize_grid_backend(self.u)
-        self._v_backend = self._normalize_grid_backend(self.v)
-
+        spharm_layout = (
+            "auto"
+            if (str(layout).lower() == "auto" and self.u.ndim == 1)
+            else self._layout
+        )
         self.s = ReducedGaussianSpharmt(
             self.pl,
             rsphere=rsphere,
             legfunc=legfunc,
             precision=precision,
+            layout=spharm_layout,
+            lat_order=lat_order,
+            lat=self._lat,
         )
+        self._u_backend = self._normalize_grid_backend(self.u)
+        self._v_backend = self._normalize_grid_backend(self.v)
+
         self.gridtype = self.s.gridtype
         self.rsphere = self.s.rsphere
         self.legfunc = self.s.legfunc
+        self.precision = self.s.precision
+        self.layout = self._layout
+        self.lat_order = self.s.lat_order
+        self.south_to_north = self.s.south_to_north
+        self.rotationalcomponent = self.nondivergentcomponent
+        self.divergentcomponent = self.irrotationalcomponent
         self._latitude_cache: Optional[np.ndarray] = None
         self._planetary_vorticity_cache: Dict[
             Tuple[float, str, Tuple[int, ...]], np.ndarray
@@ -151,17 +192,39 @@ class ReducedVectorWind:
             return array
         return array.astype(target_dtype, copy=False)
 
-    def _normalize_grid_backend(self, data: np.ndarray) -> np.ndarray:
-        return np.asfortranarray(
-            np.asarray(data).reshape(self.u.shape[0], self._nt), dtype=np.float32
-        )
+    def _normalize_grid_backend(
+        self, data: np.ndarray, compute_dtype: Optional[np.dtype] = None
+    ) -> np.ndarray:
+        if compute_dtype is None:
+            target_dtype = (
+                np.dtype(np.float64)
+                if self._resolved_output_dtype() == np.dtype(np.float64)
+                else np.dtype(np.float32)
+            )
+        else:
+            target_dtype = np.dtype(compute_dtype)
+
+        npoints = int(self.pl.sum())
+        arr = np.asarray(data)
+        if arr.ndim == 1:
+            return np.ascontiguousarray(arr, dtype=target_dtype).reshape(1, npoints).T
+        if getattr(self, "_layout", "legacy") == "c":
+            return np.ascontiguousarray(
+                arr.reshape(self._nt, npoints), dtype=target_dtype
+            ).T
+        return np.asfortranarray(arr.reshape(npoints, self._nt), dtype=target_dtype)
 
     def _restore_grid(
         self, datagrid: np.ndarray, output_dtype: Optional[np.dtype] = None
     ) -> np.ndarray:
-        return self.s._restore_grid_shape(
-            datagrid, self._extra_shape, self._resolved_output_dtype(output_dtype)
-        )
+        arr = np.asarray(datagrid)
+        if not self._extra_shape:
+            out = arr[:, 0]
+        elif getattr(self, "_layout", "legacy") == "c":
+            out = arr.T.reshape(self._extra_shape + (int(self.pl.sum()),))
+        else:
+            out = arr.reshape((int(self.pl.sum()),) + self._extra_shape)
+        return out.astype(self._resolved_output_dtype(output_dtype), copy=False)
 
     @staticmethod
     def _process_input_array(arr: ArrayLike, name: str) -> np.ndarray:
@@ -181,7 +244,9 @@ class ReducedVectorWind:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Cannot convert {name} to numpy array: {exc}") from exc
 
-    def _validate_input_data(self) -> None:
+    def _validate_input_data(
+        self, layout: str = "auto", raw_flags: object = None
+    ) -> Tuple[str, Tuple[int, ...]]:
         if self.u.shape != self.v.shape:
             raise ValueError(
                 f"Wind components must have identical shapes. "
@@ -192,13 +257,56 @@ class ReducedVectorWind:
                 f"Packed wind components must be at least 1D, got {self.u.ndim}D"
             )
         expected = int(self.pl.sum())
-        if self.u.shape[0] != expected:
+        norm_layout = str(layout).lower()
+        if norm_layout not in ("legacy", "c", "auto"):
             raise ValueError(
-                f"Packed first dimension must be sum(pl)={expected}, "
-                f"got {self.u.shape[0]}"
+                f'layout must be "legacy", "c", or "auto", got "{layout}"'
             )
+
+        if self.u.ndim == 1:
+            if self.u.shape[0] != expected:
+                raise ValueError(
+                    f"Packed first dimension must be sum(pl)={expected}, "
+                    f"got {self.u.shape[0]}"
+                )
+            resolved_layout, extra_shape = "c", ()
+        elif norm_layout == "legacy":
+            if self.u.shape[0] != expected:
+                raise ValueError(
+                    f"Packed first dimension must be sum(pl)={expected}, "
+                    f"got {self.u.shape[0]}"
+                )
+            resolved_layout, extra_shape = "legacy", tuple(self.u.shape[1:])
+        elif norm_layout == "c":
+            if self.u.shape[-1] != expected:
+                raise ValueError(
+                    f"Packed trailing dimension must be sum(pl)={expected}, "
+                    f"got {self.u.shape[-1]}"
+                )
+            resolved_layout, extra_shape = "c", tuple(self.u.shape[:-1])
+        else:
+            is_c = self.u.shape[-1] == expected
+            is_legacy = self.u.shape[0] == expected
+            if is_c and not is_legacy:
+                resolved_layout, extra_shape = "c", tuple(self.u.shape[:-1])
+            elif is_legacy and not is_c:
+                resolved_layout, extra_shape = "legacy", tuple(self.u.shape[1:])
+            elif is_c and is_legacy:
+                if getattr(raw_flags, "f_contiguous", False) and not getattr(
+                    raw_flags, "c_contiguous", True
+                ):
+                    resolved_layout, extra_shape = "legacy", tuple(self.u.shape[1:])
+                else:
+                    resolved_layout, extra_shape = "c", tuple(self.u.shape[:-1])
+            else:
+                raise ValueError(
+                    f"Packed wind dimension must be sum(pl)={expected}, "
+                    f"got shape {self.u.shape}"
+                )
+
         if not np.isfinite(self.u).all() or not np.isfinite(self.v).all():
             raise ValueError("Input wind components must be finite")
+        return resolved_layout, extra_shape
 
     def _validate_scalar_field(self, field: ArrayLike, name: str) -> np.ndarray:
         try:
@@ -226,8 +334,15 @@ class ReducedVectorWind:
 
     def _latitude_values(self) -> np.ndarray:
         if self._latitude_cache is None:
-            lat, _ = gaussian_lats_wts(int(self.pl.size))
-            self._latitude_cache = np.repeat(lat, self.pl)
+            s2n = bool(getattr(self.s, "south_to_north", False))
+            pl_ordered = self.pl[::-1] if s2n else self.pl
+            explicit_lat = getattr(self, "_lat", None)
+            if explicit_lat is not None:
+                lat_ordered = explicit_lat
+            else:
+                lat, _ = gaussian_lats_wts(int(self.pl.size))
+                lat_ordered = lat[::-1] if s2n else lat
+            self._latitude_cache = np.repeat(lat_ordered, pl_ordered)
         return self._latitude_cache
 
     def _planetary_vorticity_values(
@@ -235,15 +350,22 @@ class ReducedVectorWind:
         omega: Optional[float] = None,
         dtype: Optional[np.dtype] = None,
         shape: Optional[Tuple[int, ...]] = None,
+        point_axis: Optional[int] = None,
     ) -> np.ndarray:
         omega_value = 7.292e-05 if omega is None else float(omega)
         target_dtype = self._u_backend.dtype if dtype is None else np.dtype(dtype)
         target_shape = self.u.shape if shape is None else tuple(shape)
-        key = (omega_value, target_dtype.str, target_shape)
+        resolved_axis = (
+            (-1 if getattr(self, "_layout", "legacy") == "c" else 0)
+            if point_axis is None
+            else point_axis
+        )
+        key = (omega_value, target_dtype.str, target_shape, resolved_axis)
         cached = self._planetary_vorticity_cache.get(key)
         if cached is not None:
             return cached
 
+        npoints = int(self.pl.sum())
         values = np.asarray(
             2.0 * omega_value * np.sin(np.deg2rad(self._latitude_values())),
             dtype=target_dtype,
@@ -251,8 +373,11 @@ class ReducedVectorWind:
         if len(target_shape) == 1:
             broadcast = np.broadcast_to(values, target_shape)
             result = np.array(broadcast, copy=True)
+        elif resolved_axis == 0:
+            row = values.reshape(npoints, *([1] * (len(target_shape) - 1)))
+            result = np.broadcast_to(row, target_shape)
         else:
-            row = values.reshape(target_shape[0], *([1] * (len(target_shape) - 1)))
+            row = values.reshape(*([1] * (len(target_shape) - 1)), npoints)
             result = np.broadcast_to(row, target_shape)
         self._planetary_vorticity_cache[key] = result
         return result
@@ -274,6 +399,7 @@ class ReducedVectorWind:
             omega=omega,
             dtype=self._u_backend.dtype,
             shape=self._u_backend.shape,
+            point_axis=0,
         )
 
     def _planetary_vorticity_spec(
@@ -291,7 +417,9 @@ class ReducedVectorWind:
         return dataspec
 
     def _coriolis(self, omega: Optional[float] = None) -> np.ndarray:
-        return self._planetary_vorticity_values(omega=omega, shape=(self.u.shape[0],))
+        return self._planetary_vorticity_values(
+            omega=omega, shape=(int(self.pl.sum()),)
+        )
 
     def _ntrunc(self, truncation: Optional[int]) -> int:
         return self.s._validate_ntrunc(truncation)
@@ -459,9 +587,15 @@ class ReducedVectorWind:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return vector gradient of a packed scalar field."""
         output_dtype = self._infer_output_dtype(chi)
+        compute_dtype = (
+            np.dtype(np.float64)
+            if self._resolved_output_dtype(output_dtype) == np.dtype(np.float64)
+            else np.dtype(np.float32)
+        )
         field = self._validate_scalar_field(chi, "chi")
         chi_spec = self.s._analyze_scalar(
-            self._normalize_grid_backend(field), truncation
+            self._normalize_grid_backend(field, compute_dtype=compute_dtype),
+            truncation,
         )
         u_chi, v_chi = self.s._synthesize_gradient(chi_spec, truncation)
         return (
@@ -474,9 +608,15 @@ class ReducedVectorWind:
     ) -> np.ndarray:
         """Apply spectral truncation to a packed scalar field."""
         output_dtype = self._infer_output_dtype(field)
+        compute_dtype = (
+            np.dtype(np.float64)
+            if self._resolved_output_dtype(output_dtype) == np.dtype(np.float64)
+            else np.dtype(np.float32)
+        )
         scalar = self._validate_scalar_field(field, "field")
         field_spec = self.s._analyze_scalar(
-            self._normalize_grid_backend(scalar), truncation
+            self._normalize_grid_backend(scalar, compute_dtype=compute_dtype),
+            truncation,
         )
         return self._spectogrd(field_spec, truncation, output_dtype)
 

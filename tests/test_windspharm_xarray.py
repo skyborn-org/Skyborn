@@ -608,22 +608,29 @@ class TestXarrayDifferentGridTypes:
         assert isinstance(vorticity, xr.DataArray)
 
     def test_south_to_north_latitude_ordering(self):
-        """Test automatic reversal of south-to-north latitude ordering."""
-        # Create south-to-north latitudes (wrong order)
+        """South-to-north input latitudes should preserve input order and match N2S reference."""
         lat = np.linspace(-90, 90, 19)  # South to north
         lon = np.linspace(0, 357.5, 36)
-        u_data = np.random.randn(19, 36)
-        v_data = np.random.randn(19, 36)
+        rng = np.random.default_rng(20260510)
+        u_data = rng.standard_normal((19, 36))
+        v_data = rng.standard_normal((19, 36))
 
         u = xr.DataArray(u_data, dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
         v = xr.DataArray(v_data, dims=["lat", "lon"], coords={"lat": lat, "lon": lon})
+        u_n2s = xr.DataArray(
+            u_data[::-1], dims=["lat", "lon"], coords={"lat": lat[::-1], "lon": lon}
+        )
+        v_n2s = xr.DataArray(
+            v_data[::-1], dims=["lat", "lon"], coords={"lat": lat[::-1], "lon": lon}
+        )
 
         vw = VectorWind(u, v)
-        # Should automatically reverse and work
         vorticity = vw.vorticity()
+        vorticity_ref = VectorWind(u_n2s, v_n2s).vorticity()
         assert isinstance(vorticity, xr.DataArray)
-        # Output should have proper north-to-south ordering
-        assert vorticity.coords["lat"].values[0] > vorticity.coords["lat"].values[-1]
+        # Output preserves input S2N latitude ordering and matches N2S reference
+        assert vorticity.coords["lat"].values[0] < vorticity.coords["lat"].values[-1]
+        np.testing.assert_allclose(vorticity.values[::-1], vorticity_ref.values, rtol=1e-12, atol=1e-12)
 
 
 @pytest.mark.skipif(not XARRAY_AVAILABLE, reason="xarray not available")
@@ -852,41 +859,60 @@ class TestXarrayTargetedCoverage:
             vw.gradient(np.zeros((19, 36), dtype=np.float32))
 
     def test_gradient_and_truncate_reverse_south_to_north_fields(self):
-        """Exercise latitude-reversal branches in gradient and truncate."""
+        """Verify S2N gradient and truncate preserve input S2N order and match N2S reference."""
         lat = np.linspace(-90.0, 90.0, 19)
         lon = np.linspace(0.0, 357.5, 36)
+        rng = np.random.default_rng(20260511)
+        u_arr = rng.standard_normal((19, 36))
+        v_arr = rng.standard_normal((19, 36))
         u = xr.DataArray(
-            np.random.randn(19, 36),
+            u_arr,
             dims=["lat", "lon"],
             coords={"lat": lat, "lon": lon},
         )
         v = xr.DataArray(
-            np.random.randn(19, 36),
+            v_arr,
             dims=["lat", "lon"],
             coords={"lat": lat, "lon": lon},
         )
         vw = VectorWind(u, v)
+        vw_n2s = VectorWind(
+            xr.DataArray(u_arr[::-1], dims=["lat", "lon"], coords={"lat": lat[::-1], "lon": lon}),
+            xr.DataArray(v_arr[::-1], dims=["lat", "lon"], coords={"lat": lat[::-1], "lon": lon}),
+        )
 
+        scalar_arr = rng.standard_normal((19, 36)).astype(np.float32)
         scalar = xr.DataArray(
-            np.random.randn(19, 36).astype(np.float32),
+            scalar_arr,
             dims=["lat", "lon"],
             coords={"lat": lat, "lon": lon},
             name="temperature",
         )
+        scalar_n2s = xr.DataArray(
+            scalar_arr[::-1],
+            dims=["lat", "lon"],
+            coords={"lat": lat[::-1], "lon": lon},
+            name="temperature",
+        )
 
         grad_u, grad_v = vw.gradient(scalar)
+        grad_u_ref, grad_v_ref = vw_n2s.gradient(scalar_n2s)
         assert isinstance(grad_u, xr.DataArray)
         assert isinstance(grad_v, xr.DataArray)
         assert grad_u.dtype == scalar.dtype
         assert grad_v.dtype == scalar.dtype
-        assert grad_u.coords["lat"].values[0] > grad_u.coords["lat"].values[-1]
+        assert grad_u.coords["lat"].values[0] < grad_u.coords["lat"].values[-1]
+        np.testing.assert_allclose(grad_u.values[::-1], grad_u_ref.values, rtol=1e-5, atol=1e-10)
+        np.testing.assert_allclose(grad_v.values[::-1], grad_v_ref.values, rtol=1e-5, atol=1e-10)
         assert grad_u.name == "zonal_gradient_of_temperature"
         assert grad_v.name == "meridional_gradient_of_temperature"
 
         trunc = vw.truncate(scalar, truncation=10)
+        trunc_ref = vw_n2s.truncate(scalar_n2s, truncation=10)
         assert isinstance(trunc, xr.DataArray)
         assert trunc.dtype == scalar.dtype
-        assert trunc.coords["lat"].values[0] > trunc.coords["lat"].values[-1]
+        assert trunc.coords["lat"].values[0] < trunc.coords["lat"].values[-1]
+        np.testing.assert_allclose(trunc.values[::-1], trunc_ref.values, rtol=1e-5, atol=1e-6)
 
     def test_gradient_and_truncate_avoid_api_order_copy(self, monkeypatch):
         """API-ordered scalar fields should be handed to standard API as views."""
@@ -1101,3 +1127,35 @@ class TestXarrayReducedVectorWind:
         vw = object.__new__(XarrayReducedVectorWind)
         with pytest.raises(ValueError, match="Mismatched coordinates"):
             vw._validate_coordinates(FakeArray(), FakeArray())
+
+    def test_reduced_xarray_corder_no_transpose_and_public_attrs(self, reduced_xarray_data):
+        u_leg, v_leg, pl = reduced_xarray_data
+        u_c = u_leg.transpose("time", "point")
+        v_c = v_leg.transpose("time", "point")
+        vw_c = XarrayReducedVectorWind(u_c, v_c, pl, precision="single")
+        vw_l = XarrayReducedVectorWind(u_leg, v_leg, pl, precision="single")
+
+        assert vw_c._needs_transpose is False
+        assert vw_c.precision == "single"
+        assert vw_c.rotationalcomponent == vw_c.nondivergentcomponent
+        assert vw_c.divergentcomponent == vw_c.irrotationalcomponent
+
+        vrt_c = vw_c.vorticity(truncation=5)
+        assert vrt_c.dims == ("time", "point")
+        np.testing.assert_allclose(
+            vrt_c.values, vw_l.vorticity(truncation=5).transpose("time", "point").values, rtol=0, atol=0
+        )
+
+        # Standard xarray VectorWind public attrs match ReducedVectorWind
+        lats = np.linspace(-90.0, 90.0, 19)
+        lons = np.linspace(0.0, 350.0, 36)
+        u_std = xr.DataArray(
+            np.random.default_rng(77).standard_normal((2, 19, 36)).astype(np.float32),
+            dims=["time", "lat", "lon"],
+            coords={"time": [0, 1], "lat": lats, "lon": lons},
+        )
+        vw_std = VectorWind(u_std, u_std * 0.5)
+        assert vw_std.gridtype == "regular"
+        assert vw_std.precision == "auto"
+        assert hasattr(vw_std, "s")
+        assert vw_std.rotationalcomponent == vw_std.nondivergentcomponent

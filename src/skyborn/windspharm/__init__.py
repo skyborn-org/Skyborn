@@ -25,10 +25,12 @@ Example:
     >>> psi, chi = vw.sfvp()
 
 Notes:
-    The NumPy-facing ``VectorWind`` interface expects latitude to run
-    north-to-south. If your array is south-to-north, reorder it first with
-    ``skyborn.windspharm.tools.order_latdim`` or use the xarray interface,
-    which handles latitude reordering automatically.
+    ``VectorWind`` and ``ReducedVectorWind`` default to ``layout="auto"``, which
+    automatically detects C-order ``(..., nlat, nlon)`` arrays (zero-copy) as
+    well as legacy ``(nlat, nlon, ...)`` arrays without requiring manual
+    transposition. Pass ``lat_order="S2N"`` or ``lat=...`` to process
+    south-to-north data directly, or use the ``xarray`` interface for
+    automatic coordinate and metadata handling.
 """
 
 from __future__ import absolute_import
