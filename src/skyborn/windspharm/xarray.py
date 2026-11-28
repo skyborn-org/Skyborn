@@ -986,33 +986,15 @@ class VectorWind:
             description="Generation term for Rossby wave activity",
         )
 
-    def truncate(self, field: DataArray, truncation: Optional[int] = None) -> DataArray:
-        """
-        Apply spectral truncation to a scalar field.
-
-        Parameters
-        ----------
-        field : DataArray
-            Scalar field with same latitude/longitude dimensions as wind components
-        truncation : int, optional
-            Triangular truncation limit. If None, defaults to nlat-1
-
-        Returns
-        -------
-        DataArray
-            Field with spectral truncation applied
-
-        Examples
-        --------
-        >>> field_trunc = vw.truncate(scalar_field)
-        >>> field_t21 = vw.truncate(scalar_field, truncation=21)
-        """
+    def _prepare_scalar_dataarray(
+        self, field: DataArray
+    ) -> Tuple[DataArray, Tuple[Any, ...], bool, Tuple[int, ...], list[Any]]:
+        """Align a scalar DataArray to the underlying API's lat/lon order and layout."""
         if not isinstance(field, xr.DataArray):
             raise TypeError(
                 f"Field must be xarray.DataArray, got {type(field).__name__}"
             )
 
-        # Process coordinate ordering
         lat, lat_dim = _find_latitude_coordinate(field)
         lon, lon_dim = _find_longitude_coordinate(field)
 
@@ -1044,10 +1026,36 @@ class VectorWind:
 
         ishape = field.shape
         coords = [field.coords[n] for n in field.dims]
+        return field, reorder, needs_transpose, ishape, coords
+
+    def truncate(self, field: DataArray, truncation: Optional[int] = None) -> DataArray:
+        """
+        Apply spectral truncation to a scalar field.
+
+        Parameters
+        ----------
+        field : DataArray
+            Scalar field with same latitude/longitude dimensions as wind components
+        truncation : int, optional
+            Triangular truncation limit. If None, defaults to nlat-1
+
+        Returns
+        -------
+        DataArray
+            Field with spectral truncation applied
+
+        Examples
+        --------
+        >>> field_trunc = vw.truncate(scalar_field)
+        >>> field_t21 = vw.truncate(scalar_field, truncation=21)
+        """
+        prepared, reorder, needs_transpose, ishape, coords = (
+            self._prepare_scalar_dataarray(field)
+        )
 
         # Apply truncation using standard API
         field_trunc = np.asarray(
-            self._api.truncate(field.values, truncation=truncation)
+            self._api.truncate(prepared.values, truncation=truncation)
         )
         if field_trunc.shape != ishape:
             field_trunc = field_trunc.reshape(ishape)
@@ -1057,8 +1065,45 @@ class VectorWind:
         result = xr.DataArray(
             field_trunc,
             coords=coords,
-            name=field.name,
-            attrs=field.attrs,
+            name=prepared.name,
+            attrs=prepared.attrs,
+        )
+        if needs_transpose:
+            result = result.transpose(*reorder)
+
+        return result
+
+    def invlap(self, field: DataArray, truncation: Optional[int] = None) -> DataArray:
+        """
+        Solve the spherical Poisson equation ``nabla^2 psi = field`` on the grid.
+
+        Parameters
+        ----------
+        field : DataArray
+            Scalar field with same latitude/longitude dimensions as wind components
+        truncation : int, optional
+            Triangular truncation limit. If None, defaults to nlat-1
+
+        Returns
+        -------
+        DataArray
+            Inverse Laplacian named ``"inverse_laplacian"`` preserving dims/coords
+        """
+        prepared, reorder, needs_transpose, ishape, coords = (
+            self._prepare_scalar_dataarray(field)
+        )
+
+        field_inv = np.asarray(
+            self._api.invlap(prepared.values, truncation=truncation)
+        )
+        if field_inv.shape != ishape:
+            field_inv = field_inv.reshape(ishape)
+
+        result = xr.DataArray(
+            field_inv,
+            coords=coords,
+            name="inverse_laplacian",
+            attrs={"long_name": "inverse_laplacian"},
         )
         if needs_transpose:
             result = result.transpose(*reorder)
@@ -1424,8 +1469,7 @@ class ReducedVectorWind:
             ),
         )
 
-    def truncate(self, field: DataArray, truncation: Optional[int] = None) -> DataArray:
-        """Apply spectral truncation to a packed scalar field."""
+    def _prepare_scalar_dataarray(self, field: DataArray) -> DataArray:
         if not isinstance(field, xr.DataArray):
             raise TypeError(
                 f"Field must be xarray.DataArray, got {type(field).__name__}"
@@ -1433,6 +1477,11 @@ class ReducedVectorWind:
         api_dims = tuple(c.name for c in self._coords)
         if field.dims != api_dims and set(field.dims) == set(api_dims):
             field = field.transpose(*api_dims)
+        return field
+
+    def truncate(self, field: DataArray, truncation: Optional[int] = None) -> DataArray:
+        """Apply spectral truncation to a packed scalar field."""
+        field = self._prepare_scalar_dataarray(field)
         truncated = self._api.truncate(field.values, truncation=truncation)
         result = xr.DataArray(
             truncated.reshape(self._ishape),
@@ -1443,6 +1492,16 @@ class ReducedVectorWind:
         if getattr(self, "_needs_transpose", True):
             result = result.transpose(*self._reorder)
         return result
+
+    def invlap(self, field: DataArray, truncation: Optional[int] = None) -> DataArray:
+        """Solve the spherical Poisson equation ``nabla^2 psi = field`` on the packed grid."""
+        prepared = self._prepare_scalar_dataarray(field)
+        inv = self._api.invlap(prepared.values, truncation=truncation)
+        return self._metadata(
+            inv,
+            "inverse_laplacian",
+            long_name="inverse_laplacian",
+        )
 
     def rossbywavesource(
         self, truncation: Optional[int] = None, omega: Optional[float] = None

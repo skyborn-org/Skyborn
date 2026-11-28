@@ -1393,6 +1393,44 @@ class VectorWind:
             self._restore_output_dtype(v_chi, output_dtype),
         )
 
+    def _prepare_scalar_field(self, field: ArrayLike) -> np.ndarray:
+        """Unwrap masked scalar input and reject NaN/Inf values."""
+        try:
+            field = (
+                field.filled(fill_value=np.nan) if hasattr(field, "filled") else field
+            )
+        except AttributeError:
+            pass
+
+        arr = np.asarray(field)
+        if not np.isfinite(arr).all():
+            if np.isnan(arr).any():
+                raise ValueError("field cannot contain missing values")
+            raise ValueError("field cannot contain infinite values")
+        return arr
+
+    def _scalar_spectral_transform(
+        self,
+        field: ArrayLike,
+        truncation: Optional[int] = None,
+        apply_invlap: bool = False,
+    ) -> np.ndarray:
+        """Run grdtospec -> optional invlapspec -> spectogrd on a scalar grid."""
+        field_arr = self._prepare_scalar_field(field)
+        output_dtype = self._infer_output_dtype(field_arr)
+
+        try:
+            field_spec = self.s.grdtospec(field_arr, ntrunc=truncation)
+        except ValueError as exc:
+            raise ValueError("field is not compatible") from exc
+
+        if apply_invlap:
+            field_spec = self.s.invlapspec(field_spec)
+
+        return self._restore_output_dtype(
+            self.s.spectogrd(field_spec), output_dtype
+        )
+
     def truncate(
         self, field: ArrayLike, truncation: Optional[int] = None
     ) -> np.ndarray:
@@ -1420,24 +1458,35 @@ class VectorWind:
         >>> field_trunc = vw.truncate(scalar_field)
         >>> field_t21 = vw.truncate(scalar_field, truncation=21)
         """
-        try:
-            field = (
-                field.filled(fill_value=np.nan) if hasattr(field, "filled") else field
-            )
-        except AttributeError:
-            pass
+        return self._scalar_spectral_transform(
+            field, truncation=truncation, apply_invlap=False
+        )
 
-        if np.any(np.isnan(field)):
-            raise ValueError("field cannot contain missing values")
+    def invlap(
+        self, field: ArrayLike, truncation: Optional[int] = None
+    ) -> np.ndarray:
+        """
+        Solve the spherical Poisson equation ``nabla^2 psi = field`` on the grid.
 
-        output_dtype = self._infer_output_dtype(field)
+        Applies the spectral inverse Laplacian ``-a^2 / [n(n + 1)]`` (zeroing the
+        global mean ``n = 0`` mode) and synthesizes the result back to grid space.
 
-        try:
-            field_spec = self.s.grdtospec(field, ntrunc=truncation)
-        except ValueError:
-            raise ValueError("field is not compatible")
+        Parameters
+        ----------
+        field : array_like
+            Scalar field matching the grid layout and shape of the ``VectorWind``
+            instance.
+        truncation : int, optional
+            Triangular truncation limit. If None, defaults to ``nlat - 1``.
 
-        return self._restore_output_dtype(self.s.spectogrd(field_spec), output_dtype)
+        Returns
+        -------
+        ndarray
+            Inverse Laplacian of ``field`` preserving input shape and dtype.
+        """
+        return self._scalar_spectral_transform(
+            field, truncation=truncation, apply_invlap=True
+        )
 
     def rossbywavesource(
         self, truncation: Optional[int] = None, omega: Optional[float] = None

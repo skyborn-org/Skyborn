@@ -2144,6 +2144,75 @@ class TestWindSpharmTargetedCoverage:
         assert xr_vrt.shape == (4, 3, nlat, nlon)
         np.testing.assert_allclose(xr_vrt.values, vrt_c, rtol=0, atol=0)
 
+    @pytest.mark.skipif(
+        not WINDSPHARM_AVAILABLE, reason="windspharm module not available"
+    )
+    def test_vectorwind_invlap_poisson_solver_and_spharm_reexport(self):
+        """Verify vw.invlap matches streamfunction/velocitypotential and skyborn.spharm.invlap works."""
+        from skyborn.spharm import SpharmTransform, invlap
+
+        rng = np.random.default_rng(20261202)
+        nlat, nlon = 19, 36
+        lats_s2n = np.linspace(-90.0, 90.0, nlat)
+
+        # 4D C-order float64 with S2N latitudes
+        u_4d = rng.standard_normal((2, 3, nlat, nlon)).astype(np.float64)
+        v_4d = rng.standard_normal((2, 3, nlat, nlon)).astype(np.float64)
+        vw_c = VectorWind(u_4d, v_4d, gridtype="regular", lat=lats_s2n)
+
+        vrt_c, div_c = vw_c.vrtdiv()
+        psi_c, chi_c = vw_c.sfvp()
+        inv_vrt = vw_c.invlap(vrt_c)
+        inv_div = vw_c.invlap(div_c)
+        assert inv_vrt.shape == u_4d.shape
+        assert inv_vrt.dtype == np.float64
+        np.testing.assert_allclose(inv_vrt, psi_c, rtol=1e-11, atol=1e-4)
+        np.testing.assert_allclose(inv_div, chi_c, rtol=1e-11, atol=1e-4)
+
+        # Truncation support
+        inv_vrt_t10 = vw_c.invlap(vrt_c, truncation=10)
+        np.testing.assert_allclose(
+            inv_vrt_t10, vw_c.streamfunction(truncation=10), rtol=1e-11, atol=1e-4
+        )
+
+        # 4D legacy layout and float32 precision
+        u_leg = np.moveaxis(u_4d.astype(np.float32), (2, 3), (0, 1)).copy()
+        v_leg = np.moveaxis(v_4d.astype(np.float32), (2, 3), (0, 1)).copy()
+        vw_leg = VectorWind(u_leg, v_leg, gridtype="regular", layout="legacy")
+        vrt_leg = vw_leg.vorticity()
+        inv_leg = vw_leg.invlap(vrt_leg)
+        assert inv_leg.shape == u_leg.shape
+        assert inv_leg.dtype == np.float32
+        np.testing.assert_allclose(
+            inv_leg, vw_leg.streamfunction(), rtol=1e-3, atol=2.0
+        )
+
+        # Standalone skyborn.spharm.invlap matches SpharmTransform.invlap
+        sht = SpharmTransform(nlon, nlat, gridtype="regular", lat=lats_s2n, precision="double")
+        spec = sht.grdtospec(vrt_c)
+        np.testing.assert_allclose(invlap(spec), sht.invlap(spec), rtol=0, atol=0)
+
+        # Validation: NaN, Inf, masked, incompatible shape on invlap & Inf on truncate
+        bad_nan = vrt_c.copy()
+        bad_nan[0, 0, 0, 0] = np.nan
+        with pytest.raises(ValueError, match="missing values"):
+            vw_c.invlap(bad_nan)
+
+        bad_inf = vrt_c.copy()
+        bad_inf[0, 0, 0, 0] = np.inf
+        with pytest.raises(ValueError, match="infinite values"):
+            vw_c.invlap(bad_inf)
+        with pytest.raises(ValueError, match="infinite values"):
+            vw_c.truncate(bad_inf)
+
+        masked_bad = np.ma.array(vrt_c.copy())
+        masked_bad[0, 0, 0, 0] = np.ma.masked
+        with pytest.raises(ValueError, match="missing values"):
+            vw_c.invlap(masked_bad)
+
+        with pytest.raises(ValueError, match="field is not compatible"):
+            vw_c.invlap(np.zeros((2, 3, nlat + 1, nlon)))
+
 
 if __name__ == "__main__":
     # Run tests

@@ -453,3 +453,53 @@ def test_reduced_vectorwind_double_precision_and_corder_s2n():
     vw_s2n = ReducedVectorWind(u_c, v_c, pl, lat=lats_n2s[::-1].copy())
     assert vw_s2n.south_to_north is True
     assert np.isfinite(vw_s2n.absolutevorticity(truncation=5)).all()
+
+
+@pytest.mark.skipif(not WINDSPHARM_AVAILABLE, reason="windspharm module not available")
+def test_reduced_vectorwind_invlap_poisson_solver():
+    """Verify ReducedVectorWind.invlap matches streamfunction/velocitypotential across layouts and S2N."""
+    from skyborn.spharm import gaussian_lats_wts
+
+    pl = np.array([16, 20, 24, 28, 32, 28, 24, 20, 16], dtype=np.int32)
+    npoints = int(pl.sum())
+    rng = np.random.default_rng(20261203)
+
+    # C-order double precision
+    u_c = rng.standard_normal((2, 3, npoints)).astype(np.float64)
+    v_c = rng.standard_normal((2, 3, npoints)).astype(np.float64)
+    rvw_c = ReducedVectorWind(u_c, v_c, pl, precision="double")
+    vrt_c = rvw_c.vorticity(truncation=5)
+    div_c = rvw_c.divergence(truncation=5)
+    inv_vrt = rvw_c.invlap(vrt_c, truncation=5)
+    inv_div = rvw_c.invlap(div_c, truncation=5)
+    assert inv_vrt.shape == u_c.shape
+    assert inv_vrt.dtype == np.float64
+    np.testing.assert_allclose(inv_vrt, rvw_c.streamfunction(truncation=5), rtol=1e-11, atol=1e-4)
+    np.testing.assert_allclose(inv_div, rvw_c.velocitypotential(truncation=5), rtol=1e-11, atol=1e-4)
+
+    # Legacy float32 layout
+    u_leg = np.moveaxis(u_c.astype(np.float32), -1, 0).copy()
+    v_leg = np.moveaxis(v_c.astype(np.float32), -1, 0).copy()
+    rvw_leg = ReducedVectorWind(u_leg, v_leg, pl, layout="legacy")
+    vrt_leg = rvw_leg.vorticity(truncation=5)
+    inv_leg = rvw_leg.invlap(vrt_leg, truncation=5)
+    assert inv_leg.shape == u_leg.shape
+    assert inv_leg.dtype == np.float32
+    np.testing.assert_allclose(inv_leg, rvw_leg.streamfunction(truncation=5), rtol=1e-3, atol=2.0)
+
+    # S2N ordering
+    lats_n2s, _ = gaussian_lats_wts(len(pl))
+    rvw_s2n = ReducedVectorWind(u_c, v_c, pl, lat=lats_n2s[::-1].copy())
+    vrt_s2n = rvw_s2n.vorticity(truncation=5)
+    np.testing.assert_allclose(
+        rvw_s2n.invlap(vrt_s2n, truncation=5),
+        rvw_s2n.streamfunction(truncation=5),
+        rtol=1e-11,
+        atol=1e-4,
+    )
+
+    # Validation
+    bad = vrt_c.copy()
+    bad[0, 0, 0] = np.inf
+    with pytest.raises(ValueError, match="cannot contain missing or infinite"):
+        rvw_c.invlap(bad)

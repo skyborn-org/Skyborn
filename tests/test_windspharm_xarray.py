@@ -1159,3 +1159,68 @@ class TestXarrayReducedVectorWind:
         assert vw_std.precision == "auto"
         assert hasattr(vw_std, "s")
         assert vw_std.rotationalcomponent == vw_std.nondivergentcomponent
+
+    def test_xarray_invlap_poisson_solver_standard_and_reduced(self, reduced_xarray_data):
+        """Verify xarray VectorWind.invlap and ReducedVectorWind.invlap preserve dims/coords & match sf/vp."""
+        # 1. Standard xarray VectorWind (4D C-order + S2N)
+        rng = np.random.default_rng(20261204)
+        lats_s2n = np.linspace(-90.0, 90.0, 19)
+        lons = np.linspace(0.0, 350.0, 36)
+        u_da = xr.DataArray(
+            rng.standard_normal((2, 3, 19, 36)).astype(np.float64),
+            dims=["time", "level", "lat", "lon"],
+            coords={"time": [0, 1], "level": [1000, 500, 200], "lat": lats_s2n, "lon": lons},
+        )
+        v_da = xr.DataArray(
+            rng.standard_normal((2, 3, 19, 36)).astype(np.float64),
+            dims=["time", "level", "lat", "lon"],
+            coords={"time": [0, 1], "level": [1000, 500, 200], "lat": lats_s2n, "lon": lons},
+        )
+        vw = VectorWind(u_da, v_da, gridtype="regular")
+        vrt = vw.vorticity()
+        div = vw.divergence()
+        inv_vrt = vw.invlap(vrt)
+        inv_div = vw.invlap(div)
+
+        assert isinstance(inv_vrt, xr.DataArray)
+        assert inv_vrt.name == "inverse_laplacian"
+        assert inv_div.name == "inverse_laplacian"
+        assert inv_vrt.dims == u_da.dims
+        assert inv_vrt.shape == u_da.shape
+        np.testing.assert_array_equal(inv_vrt.coords["lat"].values, lats_s2n)
+        np.testing.assert_allclose(inv_vrt.values, vw.streamfunction().values, rtol=1e-11, atol=1e-4)
+        np.testing.assert_allclose(inv_div.values, vw.velocitypotential().values, rtol=1e-11, atol=1e-4)
+
+        inv_vrt_t10 = vw.invlap(vrt, truncation=10)
+        np.testing.assert_allclose(
+            inv_vrt_t10.values, vw.streamfunction(truncation=10).values, rtol=1e-11, atol=1e-4
+        )
+
+        with pytest.raises(TypeError, match="Field must be xarray.DataArray"):
+            vw.invlap(vrt.values)
+
+        # 2. Reduced xarray ReducedVectorWind (C-order & legacy)
+        u_leg, v_leg, pl = reduced_xarray_data
+        u_c = u_leg.transpose("time", "point")
+        v_c = v_leg.transpose("time", "point")
+        rvw_c = XarrayReducedVectorWind(u_c, v_c, pl, precision="double")
+        rvrt = rvw_c.vorticity(truncation=5)
+        rdiv = rvw_c.divergence(truncation=5)
+        rinv_vrt = rvw_c.invlap(rvrt, truncation=5)
+        rinv_div = rvw_c.invlap(rdiv, truncation=5)
+
+        assert isinstance(rinv_vrt, xr.DataArray)
+        assert rinv_vrt.name == "inverse_laplacian"
+        assert rinv_vrt.dims == ("time", "point")
+        assert rinv_vrt.shape == u_c.shape
+        np.testing.assert_array_equal(rinv_vrt.coords["point"], u_c.coords["point"])
+        np.testing.assert_array_equal(rinv_vrt.coords["time"], u_c.coords["time"])
+        np.testing.assert_allclose(
+            rinv_vrt.values, rvw_c.streamfunction(truncation=5).values, rtol=1e-11, atol=1e-4
+        )
+        np.testing.assert_allclose(
+            rinv_div.values, rvw_c.velocitypotential(truncation=5).values, rtol=1e-11, atol=1e-4
+        )
+
+        with pytest.raises(TypeError, match="Field must be xarray.DataArray"):
+            rvw_c.invlap(rvrt.values)

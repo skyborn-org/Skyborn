@@ -620,6 +620,18 @@ class ReducedVectorWind:
         )
         return self._spectogrd(field_spec, truncation, output_dtype)
 
+    def invlap(
+        self, field: ArrayLike, truncation: Optional[int] = None
+    ) -> np.ndarray:
+        """Solve the spherical Poisson equation ``nabla^2 psi = field`` on the packed grid."""
+        output_dtype = self._infer_output_dtype(field)
+        scalar = self._validate_scalar_field(field, "field")
+        field_spec = self.s.grdtospec(scalar, ntrunc=truncation)
+        inv_spec = self.s.invlapspec(field_spec)
+        return self._restore_output_dtype(
+            self.s.spectogrd(inv_spec), output_dtype
+        )
+
     def rossbywavesource(
         self, truncation: Optional[int] = None, omega: Optional[float] = None
     ) -> np.ndarray:

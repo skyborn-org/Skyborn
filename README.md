@@ -142,6 +142,7 @@ v = np.random.randn(12, 8, nlat, nlon).astype(np.float32)
 vw = VectorWind(u, v, gridtype="regular", lat=lats_s2n, precision="auto")
 vrt, div = vw.vrtdiv()                   # (12, 8, 181, 360), float32, S2N preserved
 psi, chi = vw.sfvp()                     # streamfunction & velocity potential
+psi_poisson = vw.invlap(vrt)             # grid-space Poisson inversion (nabla^-2 vrt)
 u_chi, v_chi, u_psi, v_psi = vw.helmholtz()
 
 # 2. Direct scalar Analysis <-> Synthesis in native float64 precision
@@ -149,6 +150,7 @@ sht = SpharmTransform(
     nlon=nlon, nlat=nlat, gridtype="regular", lat=lats_s2n, precision="double"
 )
 spec = sht.grdtospec(u.astype(np.float64))  # (12, 8, nmdim)
+inv_spec = sht.invlap(spec)                 # spectral inverse Laplacian (-a^2 / [n(n+1)])
 u_rec = sht.spectogrd(spec)                 # ~1e-13 round-trip accuracy
 
 # 3. Packed ECMWF reduced Gaussian wind analysis
