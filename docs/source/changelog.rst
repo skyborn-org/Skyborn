@@ -1,6 +1,69 @@
 Changelog
 =========
 
+Unreleased
+----------
+
+**Rust spherical harmonic backend (requires ``skyborn-spharm>=0.2.0``)**
+
+* **Pure-Rust SPHEREPACK engine behind ``skyborn.spharm``**: ``skyborn.spharm``
+  now re-exports the Pure-Rust ``skyborn-spharm`` 0.2.0 engine, so no Fortran
+  runtime is needed. The public import names are unchanged, and the Rust
+  results were checked against the Fortran reference implementation (float32
+  and float64, regular, Gaussian and reduced Gaussian grids).
+* **New transform classes**: ``SpharmTransform`` and
+  ``ReducedGaussianTransform`` (C-order ``(..., nlat, nlon)`` by default) are
+  available next to the legacy-compatible ``Spharmt`` and
+  ``ReducedGaussianSpharmt``.
+* **Public inverse Laplacian**: ``invlap`` (standalone function) and
+  ``invlap`` / ``invlapspec`` on the transform classes solve
+  :math:`\nabla^2 \psi = \zeta` in spectral space (the global mean ``n = 0``
+  mode is set to zero).
+* **Dependency**: ``requirements/base.txt`` now requires
+  ``skyborn-spharm>=0.2.0``. Do not publish this version of ``skyborn`` to
+  PyPI before ``skyborn-spharm`` 0.2.0 is available there.
+
+**windspharm**
+
+* **Automatic C-order layout**: ``VectorWind`` and ``ReducedVectorWind`` accept
+  ``(..., nlat, nlon)`` (C-order) and legacy ``(nlat, nlon, ...)`` arrays
+  through ``layout="auto"`` (default, C-order preferred), without manual
+  transposition. 2D, 3D, 4D and 5D inputs are flattened internally and
+  restored to the exact input shape.
+* **South-to-north latitudes**: added the ``lat_order`` (``"N2S"``,
+  ``"S2N"``, ``"auto"``) and ``lat`` arguments so south-to-north grids run
+  without copying or reversing the input. ``inspect_gridtype`` accepts both
+  latitude directions.
+* **Grid-space inverse Laplacian**: added ``VectorWind.invlap``,
+  ``ReducedVectorWind.invlap`` and the xarray ``VectorWind.invlap`` /
+  ``ReducedVectorWind.invlap`` (output is named ``inverse_laplacian``).
+* **Fewer Python round-trips**: diagnostics keep the 2D ``(nt, nmdim)``
+  spectra from the Rust core instead of restoring and re-flattening them at
+  every step. ``sfvp`` calls the fused Rust ``getpsichi``, ``helmholtz`` and
+  ``rossbywavesource`` batch their gradient synthesis, and
+  ``ReducedVectorWind`` no longer transposes packed fields four times per
+  call. On a ``float32`` ``(12, 73, 144)`` field the Python-side time of
+  ``vorticity``, ``vrtdiv``, ``helmholtz``, ``rossbywavesource`` and
+  ``gradient`` dropped by about 1.4x to 1.7x (for example ``vorticity``
+  982 to 567 microseconds and ``helmholtz`` 1905 to 1101 microseconds). Results
+  are checked by the regression tests, including exact (zero tolerance)
+  agreement between N-D, flattened 3D and legacy-layout inputs.
+* **Layout scoring**: the automatic ``(nlat, nlon)`` versus legacy detection
+  uses integer arithmetic and a cached resolver.
+* **Less duplicated code**: shared dtype inference, masked-array handling,
+  layout validation, finite-value checks and coordinate validation moved into
+  ``skyborn.windspharm._common`` and shared helpers. The public method names,
+  signatures, error messages and ``grid_info`` keys are unchanged.
+
+**Continuous integration**
+
+* **Companion packages**: ``stable-ci.yml`` and ``test-coverage.yml`` install
+  ``skyborn-plot``, ``skyborn-spharm>=0.2.0`` and ``skyborn-backend``
+  separately and fall back to the GitHub sources when a PyPI release is
+  missing; a Rust toolchain and ``maturin`` are provided for those fallback
+  builds. Previously an unpinned install could pick up the Fortran
+  ``skyborn-spharm`` 0.1.0 and fail the spharm and windspharm tests.
+
 Version 0.5.0 (Current)
 -----------------------
 
