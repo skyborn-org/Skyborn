@@ -17,11 +17,16 @@ import numpy as np
 from skyborn.spharm import Spharmt, gaussian_lats_wts
 from skyborn.spharm import spherical_harmonics as spharm_mod
 
+from ._common import (
+    _LAYOUT_ALIASES,
+    infer_output_dtype,
+    normalize_layout,
+    process_input_array,
+    unwrap_masked_scalar,
+)
+
 __all__ = ["VectorWind"]
 
-_DTYPE_F32 = np.dtype(np.float32)
-_DTYPE_F64 = np.dtype(np.float64)
-_LAYOUT_ALIASES = {"auto": "auto", "c": "c", "legacy": "legacy"}
 _GRIDTYPE_IS_GAUSSIAN = {"regular": False, "gaussian": True}
 
 
@@ -54,6 +59,7 @@ def _cached_resolve_auto_layout(
     if score_l > score_c:
         return "legacy"
     return "legacy" if f_only else "c"
+
 
 # Type aliases for better readability
 ArrayLike = Union[np.ndarray, np.ma.MaskedArray]
@@ -151,47 +157,20 @@ class VectorWind:
     execute directly without extra transposition or latitude copying.
     """
 
-    def __init__(
+    def _init_common(
         self,
         u: ArrayLike,
         v: ArrayLike,
-        gridtype: GridType = "regular",
-        rsphere: float = 6.3712e6,
-        legfunc: LegFunc = "stored",
-        precision: PrecisionMode = "auto",
-        layout: LayoutMode = "auto",
-        lat_order: LatOrderMode = "auto",
-        lat: Optional[np.ndarray] = None,
+        gridtype: GridType,
+        rsphere: float,
+        legfunc: LegFunc,
+        precision: PrecisionMode,
+        layout: LayoutMode,
+        lat_order: LatOrderMode,
+        lat: Optional[np.ndarray],
+        copy: bool,
     ) -> None:
-        """
-        Initialize VectorWind instance with comprehensive data validation.
-
-        This method performs thorough validation of input wind components including
-        checks for missing values, infinite values, shape compatibility, and
-        dimensional requirements.
-
-        Args:
-            u: Zonal wind component with latitude/longitude axes.
-            v: Meridional wind component with the same shape as ``u``.
-            gridtype: Grid type - ``"regular"`` or ``"gaussian"``.
-            rsphere: Sphere radius in meters.
-            legfunc: Legendre function handling mode - ``"stored"`` or
-                ``"computed"``.
-            precision: Public output precision mode. ``"auto"`` preserves the
-                promoted input floating precision, ``"single"`` returns
-                float32 outputs, and ``"double"`` returns float64 outputs.
-            layout: Array axis ordering - ``"auto"`` (default, auto-detects
-                C-order ``(..., lat, lon)`` and legacy ``(lat, lon, ...)``),
-                ``"c"`` for ``(..., lat, lon)``, or ``"legacy"`` for ``(lat, lon, ...)``.
-            lat_order: Latitude ordering mode (``"north_to_south"``,
-                ``"south_to_north"``, ``"N2S"``, ``"S2N"``, or ``"auto"``).
-            lat: Optional 1D latitude array for south-to-north auto-detection.
-
-        Raises:
-            ValueError: If the input arrays fail shape, dimensional, or finite
-                value validation.
-        """
-        # Step 1: Handle masked arrays and resolve layout from original array metadata
+        """Shared initialization path for owned and user-supplied wind inputs."""
         raw_u = u if type(u) is np.ndarray else np.asarray(u)
         self._output_dtype = self._infer_output_dtype(raw_u, v)
         self._precision = Spharmt._validate_precision(precision)
@@ -201,16 +180,10 @@ class VectorWind:
         self._layout = self._resolve_layout(
             raw_u.shape, raw_u.flags, norm_layout, gridtype, self._lat
         )
-        self.u = self._process_input_array(u, "u")
-        self.v = self._process_input_array(v, "v")
-
-        # Step 2: Comprehensive data validation
+        self.u = self._process_input_array(u, "u", copy=copy)
+        self.v = self._process_input_array(v, "v", copy=copy)
         self._validate_input_data()
-
-        # Step 3: Validate dimensions and shapes
         self._validate_dimensions()
-
-        # Step 4: Initialize spherical harmonic transform
         nlat, nlon = self._horizontal_shape()
         spharm_layout = (
             "auto" if (norm_layout == "auto" and self.u.ndim == 2) else self._layout
@@ -227,9 +200,35 @@ class VectorWind:
             lat=self._lat,
         )
         self._setup_cached_arrays()
-
-        # Step 5: Create method aliases for backward compatibility
         self._setup_method_aliases()
+
+    def __init__(
+        self,
+        u: ArrayLike,
+        v: ArrayLike,
+        gridtype: GridType = "regular",
+        rsphere: float = 6.3712e6,
+        legfunc: LegFunc = "stored",
+        precision: PrecisionMode = "auto",
+        layout: LayoutMode = "auto",
+        lat_order: LatOrderMode = "auto",
+        lat: Optional[np.ndarray] = None,
+    ) -> None:
+        """
+        Initialize VectorWind instance with comprehensive data validation.
+        """
+        self._init_common(
+            u,
+            v,
+            gridtype=gridtype,
+            rsphere=rsphere,
+            legfunc=legfunc,
+            precision=precision,
+            layout=layout,
+            lat_order=lat_order,
+            lat=lat,
+            copy=True,
+        )
 
     @classmethod
     def _from_owned_input(
@@ -246,49 +245,24 @@ class VectorWind:
     ) -> "VectorWind":
         """Create an instance from validated wrapper-owned arrays."""
         self = cls.__new__(cls)
-        raw_u = u if type(u) is np.ndarray else np.asarray(u)
-        self._output_dtype = self._infer_output_dtype(raw_u, v)
-        self._precision = Spharmt._validate_precision(precision)
-        self._lat_order = lat_order
-        self._lat = None if lat is None else np.asarray(lat, dtype=np.float64)
-        norm_layout = self._normalize_layout(layout)
-        self._layout = self._resolve_layout(
-            raw_u.shape, raw_u.flags, norm_layout, gridtype, self._lat
+        self._init_common(
+            u,
+            v,
+            gridtype=gridtype,
+            rsphere=rsphere,
+            legfunc=legfunc,
+            precision=precision,
+            layout=layout,
+            lat_order=lat_order,
+            lat=lat,
+            copy=False,
         )
-        self.u = self._process_input_array(u, "u", copy=False)
-        self.v = self._process_input_array(v, "v", copy=False)
-        self._validate_input_data()
-        self._validate_dimensions()
-        nlat, nlon = self._horizontal_shape()
-        spharm_layout = (
-            "auto" if (norm_layout == "auto" and self.u.ndim == 2) else self._layout
-        )
-        self._initialize_spharmt(
-            nlon,
-            nlat,
-            gridtype,
-            rsphere,
-            legfunc,
-            precision,
-            layout=spharm_layout,
-            lat_order=self._lat_order,
-            lat=self._lat,
-        )
-        self._setup_cached_arrays()
-        self._setup_method_aliases()
         return self
 
     @staticmethod
     def _normalize_layout(layout: str) -> str:
         """Validate layout option."""
-        norm = _LAYOUT_ALIASES.get(layout) if type(layout) is str else None
-        if norm is None:
-            norm = _LAYOUT_ALIASES.get(str(layout).lower())
-        if norm is None:
-            raise ValueError(
-                f'layout must be "legacy", "c", or "auto", got "{layout}"'
-            )
-        return norm
+        return normalize_layout(layout)
 
     @staticmethod
     def _grid_pair_score(nlat: int, nlon: int, gridtype: str) -> int:
@@ -359,38 +333,7 @@ class VectorWind:
     @staticmethod
     def _infer_output_dtype(*arrays: ArrayLike) -> np.dtype:
         """Return the public output dtype for floating inputs."""
-        if len(arrays) == 2:
-            a0, a1 = arrays
-            if type(a0) is np.ndarray and type(a1) is np.ndarray:
-                d0, d1 = a0.dtype, a1.dtype
-                if d0 == _DTYPE_F32 and d1 == _DTYPE_F32:
-                    return _DTYPE_F32
-                if (d0 == _DTYPE_F64 or d1 == _DTYPE_F64) and (
-                    d0 == _DTYPE_F32 or d0 == _DTYPE_F64
-                ) and (d1 == _DTYPE_F32 or d1 == _DTYPE_F64):
-                    return _DTYPE_F64
-        elif len(arrays) == 1:
-            a0 = arrays[0]
-            if type(a0) is np.ndarray:
-                d0 = a0.dtype
-                if d0 == _DTYPE_F32:
-                    return _DTYPE_F32
-                if d0 == _DTYPE_F64:
-                    return _DTYPE_F64
-
-        output_dtype = None
-        for arr in arrays:
-            dtype = arr.dtype if type(arr) is np.ndarray else np.dtype(np.asarray(arr).dtype)
-            if np.issubdtype(dtype, np.floating):
-                public_dtype = dtype
-            else:
-                public_dtype = _DTYPE_F64
-            output_dtype = (
-                public_dtype
-                if output_dtype is None
-                else np.result_type(output_dtype, public_dtype)
-            )
-        return _DTYPE_F64 if output_dtype is None else output_dtype
+        return infer_output_dtype(*arrays)
 
     def _restore_output_dtype(
         self, data: np.ndarray, output_dtype: Optional[np.dtype] = None
@@ -413,46 +356,8 @@ class VectorWind:
     def _process_input_array(
         self, arr: ArrayLike, name: str, copy: bool = True
     ) -> np.ndarray:
-        """
-        Process input array handling masked arrays and creating copies.
-
-        Parameters
-        ----------
-        arr : array_like
-            Input array (u or v wind component)
-        name : str
-            Name of the array ('u' or 'v') for error messages
-
-        Returns
-        -------
-        ndarray
-            Processed numpy array
-        """
-        if type(arr) is np.ndarray and (arr.dtype == _DTYPE_F32 or arr.dtype == _DTYPE_F64):
-            return arr.copy() if copy else arr
-
-        try:
-            # Handle masked arrays
-            if hasattr(arr, "filled"):
-                masked = np.ma.asarray(arr)
-                dtype = masked.dtype
-                if not np.issubdtype(dtype, np.floating):
-                    dtype = _DTYPE_F64
-                processed = np.ma.asarray(masked, dtype=dtype).filled(fill_value=np.nan)
-                if copy:
-                    processed = processed.copy()
-            else:
-                raw = np.asarray(arr)
-                dtype = np.dtype(raw.dtype)
-                if not np.issubdtype(dtype, np.floating):
-                    dtype = _DTYPE_F64
-                processed = np.asarray(raw, dtype=dtype)
-                if copy:
-                    processed = processed.copy()
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Cannot convert {name} to numpy array: {e}")
-
-        return processed
+        """Process input array handling masked arrays and creating copies."""
+        return process_input_array(arr, name, copy=copy)
 
     def _validate_input_data(self) -> None:
         """
@@ -789,16 +694,38 @@ class VectorWind:
         self, chi: ArrayLike, truncation: Optional[int] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return vector gradient before public dtype restore."""
-        try:
-            chi = chi.filled(fill_value=np.nan) if hasattr(chi, "filled") else chi
-        except AttributeError:
-            pass
-
-        if np.any(np.isnan(chi)):
+        chi_arr = unwrap_masked_scalar(chi)
+        if np.any(np.isnan(chi_arr)):
             raise ValueError("chi cannot contain missing values")
 
+        if hasattr(self.s, "_core"):
+            try:
+                resolved_layout, nt, grid_3d, batch_shape = self.s._prepare_grid_input(
+                    chi_arr, "gradient"
+                )
+                ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
+            except ValueError as exc:
+                raise ValueError("input field is not compatible") from exc
+
+            if nt == 0:
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=grid_3d.dtype)
+                return (
+                    self.s._restore_grid_output(empty, resolved_layout, batch_shape),
+                    self.s._restore_grid_output(
+                        empty.copy(), resolved_layout, batch_shape
+                    ),
+                )
+
+            s2n = bool(getattr(self.s, "south_to_north", False))
+            spec_2d = self.s._core.grdtospec(grid_3d, ntrunc=ntrunc, south_to_north=s2n)
+            u_3d, v_3d = self.s._core.getgrad(spec_2d, south_to_north=s2n)
+            return (
+                self.s._restore_grid_output(u_3d, resolved_layout, batch_shape),
+                self.s._restore_grid_output(v_3d, resolved_layout, batch_shape),
+            )
+
         try:
-            chi_spec = self.s.grdtospec(chi, ntrunc=truncation)
+            chi_spec = self.s.grdtospec(chi_arr, ntrunc=truncation)
         except ValueError:
             raise ValueError("input field is not compatible")
 
@@ -841,6 +768,48 @@ class VectorWind:
         self._vector_analysis_layout_cache = cache
         return cache
 
+    def _vector_analysis_spectral_2d(
+        self, truncation: Optional[int] = None, component: Optional[str] = None
+    ) -> Tuple[str, Tuple[int, ...], int, bool, int, Any]:
+        """Run vector wind analysis directly in 2D (nt, nmdim) using Rust core."""
+        if component not in (None, "vrt", "div"):
+            raise ValueError(f"unsupported component: {component!r}")
+
+        layout_u, layout_v, batch_shape = self._vector_analysis_layout_inputs()
+        ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
+        resolved_layout = "c" if getattr(self, "_layout", "legacy") == "c" else "legacy"
+        s2n = bool(getattr(self.s, "south_to_north", False))
+        nt = layout_u.shape[0]
+        if nt == 0:
+            nmdim = (ntrunc + 1) * (ntrunc + 2) // 2
+            cdtype = np.complex128 if layout_u.dtype == np.float64 else np.complex64
+            empty = np.empty((0, nmdim), dtype=cdtype)
+            spec = (empty, empty.copy()) if component is None else empty
+            return resolved_layout, batch_shape, ntrunc, s2n, nt, spec
+
+        if component is None:
+            spec = self.s._core.getvrtdivspec(
+                layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+            )
+        elif component == "vrt":
+            spec = self.s._core.getvrtspec(
+                layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+            )
+        else:
+            spec = self.s._core.getdivspec(
+                layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+            )
+        return resolved_layout, batch_shape, ntrunc, s2n, nt, spec
+
+    def _planetary_vorticity_spec_2d(
+        self, truncation: Optional[int] = None, omega: Optional[float] = None
+    ) -> np.ndarray:
+        """Return cached planetary-vorticity spectrum shaped (1, nmdim) for 2D ops."""
+        fspec = self._planetary_vorticity_spec(
+            truncation=truncation, omega=omega, spectral_ndim=0
+        )
+        return fspec.reshape(1, -1)
+
     def _vector_analysis_spectral(
         self, truncation: Optional[int] = None, component: Optional[str] = None
     ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
@@ -849,37 +818,21 @@ class VectorWind:
             raise ValueError(f"unsupported component: {component!r}")
 
         if hasattr(self.s, "_core"):
-            layout_u, layout_v, batch_shape = self._vector_analysis_layout_inputs()
-            ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
-            resolved_layout = (
-                "c" if getattr(self, "_layout", "legacy") == "c" else "legacy"
-            )
-            s2n = bool(getattr(self.s, "south_to_north", False))
-            if component is None:
-                vrt_2d, div_2d = self.s._core.getvrtdivspec(
-                    layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+            resolved_layout, batch_shape, _, _, _, spec = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component=component
                 )
+            )
+            if component is None:
                 return (
                     self.s._restore_spectral_output(
-                        vrt_2d, resolved_layout, batch_shape
+                        spec[0], resolved_layout, batch_shape
                     ),
                     self.s._restore_spectral_output(
-                        div_2d, resolved_layout, batch_shape
+                        spec[1], resolved_layout, batch_shape
                     ),
                 )
-            if component == "vrt":
-                vrt_2d = self.s._core.getvrtspec(
-                    layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
-                )
-                return self.s._restore_spectral_output(
-                    vrt_2d, resolved_layout, batch_shape
-                )
-            div_2d = self.s._core.getdivspec(
-                layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
-            )
-            return self.s._restore_spectral_output(
-                div_2d, resolved_layout, batch_shape
-            )
+            return self.s._restore_spectral_output(spec, resolved_layout, batch_shape)
 
         if component is None and not hasattr(
             self.s, "_analyze_vector_harmonics_flattened"
@@ -1008,6 +961,29 @@ class VectorWind:
         >>> vrt, div = vw.vrtdiv()
         >>> vrt_t13, div_t13 = vw.vrtdiv(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, (vrt_2d, div_2d) = (
+                self._vector_analysis_spectral_2d(truncation=truncation)
+            )
+            if nt == 0:
+                rdtype = np.float64 if vrt_2d.dtype == np.complex128 else np.float32
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=rdtype)
+                vrt = self.s._restore_grid_output(empty, resolved_layout, batch_shape)
+                div = self.s._restore_grid_output(
+                    empty.copy(), resolved_layout, batch_shape
+                )
+            else:
+                grids = self.s._core.spectogrd(
+                    np.concatenate((vrt_2d, div_2d), axis=0), south_to_north=s2n
+                )
+                vrt = self.s._restore_grid_output(
+                    grids[:nt], resolved_layout, batch_shape
+                )
+                div = self.s._restore_grid_output(
+                    grids[nt:], resolved_layout, batch_shape
+                )
+            return self._restore_output_dtype(vrt), self._restore_output_dtype(div)
+
         vrtspec, divspec = self._vector_analysis_spectral(truncation=truncation)
         vrt, div = self.s._spectogrd_pair(vrtspec, divspec)
         return (
@@ -1039,6 +1015,24 @@ class VectorWind:
         >>> vrt = vw.vorticity()
         >>> vrt_t13 = vw.vorticity(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, vrt_2d = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component="vrt"
+                )
+            )
+            vrt_3d = (
+                np.empty(
+                    (0, self.s.nlat, self.s.nlon),
+                    dtype=np.float64 if vrt_2d.dtype == np.complex128 else np.float32,
+                )
+                if nt == 0
+                else self.s._core.spectogrd(vrt_2d, south_to_north=s2n)
+            )
+            return self._restore_output_dtype(
+                self.s._restore_grid_output(vrt_3d, resolved_layout, batch_shape)
+            )
+
         return self._restore_output_dtype(
             self.s.spectogrd(
                 self._vector_analysis_spectral(truncation=truncation, component="vrt")
@@ -1068,6 +1062,24 @@ class VectorWind:
         >>> div = vw.divergence()
         >>> div_t13 = vw.divergence(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, div_2d = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component="div"
+                )
+            )
+            div_3d = (
+                np.empty(
+                    (0, self.s.nlat, self.s.nlon),
+                    dtype=np.float64 if div_2d.dtype == np.complex128 else np.float32,
+                )
+                if nt == 0
+                else self.s._core.spectogrd(div_2d, south_to_north=s2n)
+            )
+            return self._restore_output_dtype(
+                self.s._restore_grid_output(div_3d, resolved_layout, batch_shape)
+            )
+
         return self._restore_output_dtype(
             self.s.spectogrd(
                 self._vector_analysis_spectral(truncation=truncation, component="div")
@@ -1129,9 +1141,12 @@ class VectorWind:
         >>> abs_vrt = vw.absolutevorticity()
         >>> abs_vrt_t13 = vw.absolutevorticity(omega=7.2921150e-5, truncation=13)
         """
-        vrt = self.s.spectogrd(
-            self._vector_analysis_spectral(truncation=truncation, component="vrt")
-        )
+        if hasattr(self.s, "_core"):
+            vrt = self.vorticity(truncation=truncation)
+        else:
+            vrt = self.s.spectogrd(
+                self._vector_analysis_spectral(truncation=truncation, component="vrt")
+            )
         return self._restore_output_dtype(
             vrt + self._planetary_vorticity(omega=omega, materialize=False)
         )
@@ -1162,6 +1177,28 @@ class VectorWind:
         >>> psi, chi = vw.sfvp()
         >>> psi_t13, chi_t13 = vw.sfvp(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            layout_u, layout_v, batch_shape = self._vector_analysis_layout_inputs()
+            ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
+            resolved_layout = (
+                "c" if getattr(self, "_layout", "legacy") == "c" else "legacy"
+            )
+            s2n = bool(getattr(self.s, "south_to_north", False))
+            nt = layout_u.shape[0]
+            if nt == 0:
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=layout_u.dtype)
+                psi = self.s._restore_grid_output(empty, resolved_layout, batch_shape)
+                chi = self.s._restore_grid_output(
+                    empty.copy(), resolved_layout, batch_shape
+                )
+            else:
+                psi_3d, chi_3d = self.s._core.getpsichi(
+                    layout_u, layout_v, ntrunc=ntrunc, south_to_north=s2n
+                )
+                psi = self.s._restore_grid_output(psi_3d, resolved_layout, batch_shape)
+                chi = self.s._restore_grid_output(chi_3d, resolved_layout, batch_shape)
+            return self._restore_output_dtype(psi), self._restore_output_dtype(chi)
+
         vrtspec, divspec = self._vector_analysis_spectral(truncation=truncation)
         psi, chi = self.s._spectogrd_pair(
             self.s._invlapspec(vrtspec, "sfvp"),
@@ -1192,6 +1229,27 @@ class VectorWind:
         >>> psi = vw.streamfunction()
         >>> psi_t13 = vw.streamfunction(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, vrt_2d = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component="vrt"
+                )
+            )
+            psi_3d = (
+                np.empty(
+                    (0, self.s.nlat, self.s.nlon),
+                    dtype=np.float64 if vrt_2d.dtype == np.complex128 else np.float32,
+                )
+                if nt == 0
+                else self.s._core.spectogrd(
+                    spharm_mod._spharm_rs.invlap(vrt_2d, self.s.rsphere),
+                    south_to_north=s2n,
+                )
+            )
+            return self._restore_output_dtype(
+                self.s._restore_grid_output(psi_3d, resolved_layout, batch_shape)
+            )
+
         psi = self.s.spectogrd(
             self.s._invlapspec(
                 self._vector_analysis_spectral(truncation=truncation, component="vrt"),
@@ -1223,6 +1281,27 @@ class VectorWind:
         >>> chi = vw.velocitypotential()
         >>> chi_t13 = vw.velocitypotential(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, div_2d = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component="div"
+                )
+            )
+            chi_3d = (
+                np.empty(
+                    (0, self.s.nlat, self.s.nlon),
+                    dtype=np.float64 if div_2d.dtype == np.complex128 else np.float32,
+                )
+                if nt == 0
+                else self.s._core.spectogrd(
+                    spharm_mod._spharm_rs.invlap(div_2d, self.s.rsphere),
+                    south_to_north=s2n,
+                )
+            )
+            return self._restore_output_dtype(
+                self.s._restore_grid_output(chi_3d, resolved_layout, batch_shape)
+            )
+
         chi = self.s.spectogrd(
             self.s._invlapspec(
                 self._vector_analysis_spectral(truncation=truncation, component="div"),
@@ -1266,6 +1345,45 @@ class VectorWind:
         >>> u_chi, v_chi, u_psi, v_psi = vw.helmholtz()
         >>> u_chi_t13, v_chi_t13, u_psi_t13, v_psi_t13 = vw.helmholtz(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, (vrt_2d, div_2d) = (
+                self._vector_analysis_spectral_2d(truncation=truncation)
+            )
+            if nt == 0:
+                rdtype = np.float64 if vrt_2d.dtype == np.complex128 else np.float32
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=rdtype)
+                return tuple(
+                    self._restore_output_dtype(
+                        self.s._restore_grid_output(
+                            empty.copy(), resolved_layout, batch_shape
+                        )
+                    )
+                    for _ in range(4)
+                )
+            psispec_2d = spharm_mod._spharm_rs.invlap(vrt_2d, self.s.rsphere)
+            chispec_2d = spharm_mod._spharm_rs.invlap(div_2d, self.s.rsphere)
+            v_all, u_all = self.s._core.getgrad(
+                np.concatenate((psispec_2d, chispec_2d), axis=0), south_to_north=s2n
+            )
+            u_chi = self.s._restore_grid_output(
+                v_all[nt:], resolved_layout, batch_shape
+            )
+            v_chi = self.s._restore_grid_output(
+                u_all[nt:], resolved_layout, batch_shape
+            )
+            u_psi = self.s._restore_grid_output(
+                -u_all[:nt], resolved_layout, batch_shape
+            )
+            v_psi = self.s._restore_grid_output(
+                v_all[:nt], resolved_layout, batch_shape
+            )
+            return (
+                self._restore_output_dtype(u_chi),
+                self._restore_output_dtype(v_chi),
+                self._restore_output_dtype(u_psi),
+                self._restore_output_dtype(v_psi),
+            )
+
         vrtspec, divspec = self._vector_analysis_spectral(truncation=truncation)
         psispec = self.s._invlapspec(vrtspec, "helmholtz")
         chispec = self.s._invlapspec(divspec, "helmholtz")
@@ -1311,6 +1429,36 @@ class VectorWind:
         >>> u_chi, v_chi = vw.irrotationalcomponent()
         >>> u_chi_t13, v_chi_t13 = vw.irrotationalcomponent(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, div_2d = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component="div"
+                )
+            )
+            if nt == 0:
+                rdtype = np.float64 if div_2d.dtype == np.complex128 else np.float32
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=rdtype)
+                return (
+                    self._restore_output_dtype(
+                        self.s._restore_grid_output(empty, resolved_layout, batch_shape)
+                    ),
+                    self._restore_output_dtype(
+                        self.s._restore_grid_output(
+                            empty.copy(), resolved_layout, batch_shape
+                        )
+                    ),
+                )
+            chispec_2d = spharm_mod._spharm_rs.invlap(div_2d, self.s.rsphere)
+            u_3d, v_3d = self.s._core.getgrad(chispec_2d, south_to_north=s2n)
+            return (
+                self._restore_output_dtype(
+                    self.s._restore_grid_output(u_3d, resolved_layout, batch_shape)
+                ),
+                self._restore_output_dtype(
+                    self.s._restore_grid_output(v_3d, resolved_layout, batch_shape)
+                ),
+            )
+
         u_chi, v_chi = self.s.getgrad(
             self.s._invlapspec(
                 self._vector_analysis_spectral(truncation=truncation, component="div"),
@@ -1352,6 +1500,36 @@ class VectorWind:
         >>> u_psi, v_psi = vw.nondivergentcomponent()
         >>> u_psi_t13, v_psi_t13 = vw.nondivergentcomponent(truncation=13)
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, vrt_2d = (
+                self._vector_analysis_spectral_2d(
+                    truncation=truncation, component="vrt"
+                )
+            )
+            if nt == 0:
+                rdtype = np.float64 if vrt_2d.dtype == np.complex128 else np.float32
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=rdtype)
+                return (
+                    self._restore_output_dtype(
+                        self.s._restore_grid_output(empty, resolved_layout, batch_shape)
+                    ),
+                    self._restore_output_dtype(
+                        self.s._restore_grid_output(
+                            empty.copy(), resolved_layout, batch_shape
+                        )
+                    ),
+                )
+            psispec_2d = spharm_mod._spharm_rs.invlap(vrt_2d, self.s.rsphere)
+            v_3d, u_3d = self.s._core.getgrad(psispec_2d, south_to_north=s2n)
+            return (
+                self._restore_output_dtype(
+                    self.s._restore_grid_output(-u_3d, resolved_layout, batch_shape)
+                ),
+                self._restore_output_dtype(
+                    self.s._restore_grid_output(v_3d, resolved_layout, batch_shape)
+                ),
+            )
+
         psispec = self.s._invlapspec(
             self._vector_analysis_spectral(truncation=truncation, component="vrt"),
             "nondivergentcomponent",
@@ -1395,14 +1573,7 @@ class VectorWind:
 
     def _prepare_scalar_field(self, field: ArrayLike) -> np.ndarray:
         """Unwrap masked scalar input and reject NaN/Inf values."""
-        try:
-            field = (
-                field.filled(fill_value=np.nan) if hasattr(field, "filled") else field
-            )
-        except AttributeError:
-            pass
-
-        arr = np.asarray(field)
+        arr = unwrap_masked_scalar(field)
         if not np.isfinite(arr).all():
             if np.isnan(arr).any():
                 raise ValueError("field cannot contain missing values")
@@ -1419,6 +1590,30 @@ class VectorWind:
         field_arr = self._prepare_scalar_field(field)
         output_dtype = self._infer_output_dtype(field_arr)
 
+        if hasattr(self.s, "_core"):
+            try:
+                resolved_layout, nt, grid_3d, batch_shape = self.s._prepare_grid_input(
+                    field_arr, "invlap" if apply_invlap else "truncate"
+                )
+                ntrunc = self.s._validate_ntrunc(truncation, self.s.nlat - 1)
+            except ValueError as exc:
+                raise ValueError("field is not compatible") from exc
+
+            if nt == 0:
+                out_3d = grid_3d
+            else:
+                s2n = bool(getattr(self.s, "south_to_north", False))
+                spec_2d = self.s._core.grdtospec(
+                    grid_3d, ntrunc=ntrunc, south_to_north=s2n
+                )
+                if apply_invlap:
+                    spec_2d = spharm_mod._spharm_rs.invlap(spec_2d, self.s.rsphere)
+                out_3d = self.s._core.spectogrd(spec_2d, south_to_north=s2n)
+            return self._restore_output_dtype(
+                self.s._restore_grid_output(out_3d, resolved_layout, batch_shape),
+                output_dtype,
+            )
+
         try:
             field_spec = self.s.grdtospec(field_arr, ntrunc=truncation)
         except ValueError as exc:
@@ -1427,9 +1622,7 @@ class VectorWind:
         if apply_invlap:
             field_spec = self.s.invlapspec(field_spec)
 
-        return self._restore_output_dtype(
-            self.s.spectogrd(field_spec), output_dtype
-        )
+        return self._restore_output_dtype(self.s.spectogrd(field_spec), output_dtype)
 
     def truncate(
         self, field: ArrayLike, truncation: Optional[int] = None
@@ -1462,9 +1655,7 @@ class VectorWind:
             field, truncation=truncation, apply_invlap=False
         )
 
-    def invlap(
-        self, field: ArrayLike, truncation: Optional[int] = None
-    ) -> np.ndarray:
+    def invlap(self, field: ArrayLike, truncation: Optional[int] = None) -> np.ndarray:
         """
         Solve the spherical Poisson equation ``nabla^2 psi = field`` on the grid.
 
@@ -1548,6 +1739,40 @@ class VectorWind:
         rotational flow by steady idealized tropical heating. Journal of the
         Atmospheric Sciences, 45(7), 1228-1251.
         """
+        if hasattr(self.s, "_core"):
+            resolved_layout, batch_shape, _, s2n, nt, (vrt_2d, div_2d) = (
+                self._vector_analysis_spectral_2d(truncation=truncation)
+            )
+            if nt == 0:
+                rdtype = np.float64 if vrt_2d.dtype == np.complex128 else np.float32
+                empty = np.empty((0, self.s.nlat, self.s.nlon), dtype=rdtype)
+                return self._restore_output_dtype(
+                    self.s._restore_grid_output(empty, resolved_layout, batch_shape)
+                )
+
+            grids_3d = self.s._core.spectogrd(
+                np.concatenate((vrt_2d, div_2d), axis=0), south_to_north=s2n
+            )
+            vrt_3d, div_3d = grids_3d[:nt], grids_3d[nt:]
+            coriolis = self._coriolis_values(omega=omega, dtype=vrt_3d.dtype).reshape(
+                1, self.s.nlat, 1
+            )
+            eta_3d = vrt_3d + coriolis
+
+            chispec_2d = spharm_mod._spharm_rs.invlap(div_2d, self.s.rsphere)
+            etaspec_2d = vrt_2d + self._planetary_vorticity_spec_2d(
+                truncation=truncation, omega=omega
+            )
+            grad_u, grad_v = self.s._core.getgrad(
+                np.concatenate((chispec_2d, etaspec_2d), axis=0), south_to_north=s2n
+            )
+            rws_3d = -eta_3d * div_3d - (
+                grad_u[:nt] * grad_u[nt:] + grad_v[:nt] * grad_v[nt:]
+            )
+            return self._restore_output_dtype(
+                self.s._restore_grid_output(rws_3d, resolved_layout, batch_shape)
+            )
+
         # Reuse the first vector analysis for both grid-space and spectral terms.
         vrtspec, divspec = self._vector_analysis_spectral(truncation=truncation)
         vrt, div = self.s._spectogrd_pair(vrtspec, divspec)

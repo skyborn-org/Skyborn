@@ -13,17 +13,104 @@ Main Functions:
 
 from __future__ import annotations
 
-from typing import List, Literal, Tuple, Union
+from typing import Any, List, Literal, Tuple, Union
 
 import numpy as np
 
 from skyborn.spharm import gaussian_lats_wts
 
-__all__ = ["get_apiorder", "inspect_gridtype", "to3d"]
+__all__ = [
+    "get_apiorder",
+    "infer_output_dtype",
+    "inspect_gridtype",
+    "normalize_layout",
+    "process_input_array",
+    "to3d",
+    "unwrap_masked_scalar",
+]
 
 # Type aliases for better readability
 ArrayLike = Union[np.ndarray, np.ma.MaskedArray]
 GridType = Literal["regular", "gaussian"]
+
+_DTYPE_F32 = np.dtype(np.float32)
+_DTYPE_F64 = np.dtype(np.float64)
+_LAYOUT_ALIASES = {"auto": "auto", "c": "c", "legacy": "legacy"}
+
+
+def normalize_layout(layout: str) -> str:
+    """Validate and normalize axis layout mode ('auto', 'c', or 'legacy')."""
+    norm = _LAYOUT_ALIASES.get(layout) if type(layout) is str else None
+    if norm is None:
+        norm = _LAYOUT_ALIASES.get(str(layout).lower())
+    if norm is None:
+        raise ValueError(f'layout must be "legacy", "c", or "auto", got "{layout}"')
+    return norm
+
+
+def infer_output_dtype(*arrays: ArrayLike) -> np.dtype:
+    """Return the promoted public floating output dtype for array inputs."""
+    if len(arrays) == 2:
+        a0, a1 = arrays
+        if type(a0) is np.ndarray and type(a1) is np.ndarray:
+            d0, d1 = a0.dtype, a1.dtype
+            if d0 == _DTYPE_F32 and d1 == _DTYPE_F32:
+                return _DTYPE_F32
+            if d0 in (_DTYPE_F32, _DTYPE_F64) and d1 in (_DTYPE_F32, _DTYPE_F64):
+                return _DTYPE_F64
+    elif len(arrays) == 1:
+        a0 = arrays[0]
+        if type(a0) is np.ndarray:
+            d0 = a0.dtype
+            if d0 == _DTYPE_F32 or d0 == _DTYPE_F64:
+                return d0
+
+    output_dtype = None
+    for arr in arrays:
+        dtype = (
+            arr.dtype if type(arr) is np.ndarray else np.dtype(np.asarray(arr).dtype)
+        )
+        public_dtype = dtype if np.issubdtype(dtype, np.floating) else _DTYPE_F64
+        output_dtype = (
+            public_dtype
+            if output_dtype is None
+            else np.result_type(output_dtype, public_dtype)
+        )
+    return _DTYPE_F64 if output_dtype is None else output_dtype
+
+
+def unwrap_masked_scalar(field: Any) -> np.ndarray:
+    """Convert masked/array scalar input to ndarray, replacing masks with NaN."""
+    try:
+        unwrapped = (
+            field.filled(fill_value=np.nan) if hasattr(field, "filled") else field
+        )
+    except AttributeError:
+        unwrapped = field
+    return unwrapped if type(unwrapped) is np.ndarray else np.asarray(unwrapped)
+
+
+def process_input_array(arr: ArrayLike, name: str, copy: bool = True) -> np.ndarray:
+    """Coerce an array or MaskedArray wind input to floating ndarray."""
+    if type(arr) is np.ndarray and (arr.dtype == _DTYPE_F32 or arr.dtype == _DTYPE_F64):
+        return arr.copy() if copy else arr
+
+    try:
+        if hasattr(arr, "filled"):
+            masked = np.ma.asarray(arr)
+            dtype = (
+                masked.dtype if np.issubdtype(masked.dtype, np.floating) else _DTYPE_F64
+            )
+            processed = np.ma.asarray(masked, dtype=dtype).filled(fill_value=np.nan)
+        else:
+            raw = np.asarray(arr)
+            dtype = np.dtype(raw.dtype)
+            if not np.issubdtype(dtype, np.floating):
+                dtype = _DTYPE_F64
+            processed = np.asarray(raw, dtype=dtype)
+        return processed.copy() if copy else processed
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Cannot convert {name} to numpy array: {exc}") from exc
 
 
 def get_apiorder(

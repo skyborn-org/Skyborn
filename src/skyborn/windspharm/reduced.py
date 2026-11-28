@@ -2,11 +2,21 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Literal, Optional, Tuple, Union
 
 import numpy as np
 
 from skyborn.spharm import ReducedGaussianSpharmt, gaussian_lats_wts
+
+from ._common import (
+    _DTYPE_F32,
+    _DTYPE_F64,
+    infer_output_dtype,
+    normalize_layout,
+    process_input_array,
+    unwrap_masked_scalar,
+)
 
 ArrayLike = Union[np.ndarray, np.ma.MaskedArray]
 LegFunc = Literal["stored", "computed"]
@@ -99,22 +109,18 @@ class ReducedVectorWind:
         Raises:
             ValueError: If ``u``, ``v``, or ``pl`` fails validation.
         """
-        raw_u = np.asarray(u)
+        raw_u = u if type(u) is np.ndarray else np.asarray(u)
         self.pl = self._validate_pl(pl)
-        self._output_dtype = self._infer_output_dtype(u, v)
+        self._output_dtype = self._infer_output_dtype(raw_u, v)
         self._precision = ReducedGaussianSpharmt._validate_precision(precision)
         self._lat = None if lat is None else np.asarray(lat, dtype=np.float64)
         self.u = self._process_input_array(u, "u")
         self.v = self._process_input_array(v, "v")
-        self._layout, self._extra_shape = self._validate_input_data(
-            layout, raw_u.flags
-        )
-        self._nt = (
-            int(np.prod(self._extra_shape, dtype=int)) if self._extra_shape else 1
-        )
+        self._layout, self._extra_shape = self._validate_input_data(layout, raw_u.flags)
+        self._nt = math.prod(self._extra_shape) if self._extra_shape else 1
         spharm_layout = (
             "auto"
-            if (str(layout).lower() == "auto" and self.u.ndim == 1)
+            if (normalize_layout(layout) == "auto" and self.u.ndim == 1)
             else self._layout
         )
         self.s = ReducedGaussianSpharmt(
@@ -160,33 +166,21 @@ class ReducedVectorWind:
 
     @staticmethod
     def _infer_output_dtype(*arrays: ArrayLike) -> np.dtype:
-        output_dtype = None
-        for arr in arrays:
-            dtype = np.dtype(np.asarray(arr).dtype)
-            if np.issubdtype(dtype, np.floating):
-                public_dtype = dtype
-            else:
-                public_dtype = np.dtype(np.float64)
-            output_dtype = (
-                public_dtype
-                if output_dtype is None
-                else np.result_type(output_dtype, public_dtype)
-            )
-        return np.dtype(np.float64 if output_dtype is None else output_dtype)
+        return infer_output_dtype(*arrays)
 
     def _resolved_output_dtype(
         self, output_dtype: Optional[np.dtype] = None
     ) -> np.dtype:
         if self._precision == "double":
-            return np.dtype(np.float64)
+            return _DTYPE_F64
         if self._precision == "single":
-            return np.dtype(np.float32)
+            return _DTYPE_F32
         return self._output_dtype if output_dtype is None else np.dtype(output_dtype)
 
     def _restore_output_dtype(
         self, data: np.ndarray, output_dtype: Optional[np.dtype] = None
     ) -> np.ndarray:
-        array = np.asarray(data)
+        array = data if type(data) is np.ndarray else np.asarray(data)
         target_dtype = self._resolved_output_dtype(output_dtype)
         if array.dtype == target_dtype:
             return array
@@ -197,52 +191,53 @@ class ReducedVectorWind:
     ) -> np.ndarray:
         if compute_dtype is None:
             target_dtype = (
-                np.dtype(np.float64)
-                if self._resolved_output_dtype() == np.dtype(np.float64)
-                else np.dtype(np.float32)
+                _DTYPE_F64
+                if self._resolved_output_dtype() == _DTYPE_F64
+                else _DTYPE_F32
             )
         else:
             target_dtype = np.dtype(compute_dtype)
 
         npoints = int(self.pl.sum())
-        arr = np.asarray(data)
+        arr = data if type(data) is np.ndarray else np.asarray(data)
         if arr.ndim == 1:
-            return np.ascontiguousarray(arr, dtype=target_dtype).reshape(1, npoints).T
+            reshaped = arr.reshape(1, npoints)
+            return (
+                reshaped
+                if reshaped.dtype == target_dtype and reshaped.flags.c_contiguous
+                else np.ascontiguousarray(reshaped, dtype=target_dtype)
+            )
         if getattr(self, "_layout", "legacy") == "c":
-            return np.ascontiguousarray(
-                arr.reshape(self._nt, npoints), dtype=target_dtype
-            ).T
-        return np.asfortranarray(arr.reshape(npoints, self._nt), dtype=target_dtype)
+            reshaped = arr.reshape(self._nt, npoints)
+            return (
+                reshaped
+                if reshaped.dtype == target_dtype and reshaped.flags.c_contiguous
+                else np.ascontiguousarray(reshaped, dtype=target_dtype)
+            )
+        return np.ascontiguousarray(
+            np.moveaxis(arr.reshape(npoints, self._nt), 0, -1), dtype=target_dtype
+        )
 
     def _restore_grid(
         self, datagrid: np.ndarray, output_dtype: Optional[np.dtype] = None
     ) -> np.ndarray:
-        arr = np.asarray(datagrid)
+        arr = datagrid if type(datagrid) is np.ndarray else np.asarray(datagrid)
         if not self._extra_shape:
-            out = arr[:, 0]
+            out = arr[0]
         elif getattr(self, "_layout", "legacy") == "c":
-            out = arr.T.reshape(self._extra_shape + (int(self.pl.sum()),))
+            out = arr.reshape(self._extra_shape + (int(self.pl.sum()),))
         else:
-            out = arr.reshape((int(self.pl.sum()),) + self._extra_shape)
-        return out.astype(self._resolved_output_dtype(output_dtype), copy=False)
+            out = np.moveaxis(arr, 0, -1).reshape(
+                (int(self.pl.sum()),) + self._extra_shape
+            )
+        target_dtype = self._resolved_output_dtype(output_dtype)
+        return (
+            out if out.dtype == target_dtype else out.astype(target_dtype, copy=False)
+        )
 
     @staticmethod
     def _process_input_array(arr: ArrayLike, name: str) -> np.ndarray:
-        try:
-            if hasattr(arr, "filled"):
-                masked = np.ma.asarray(arr)
-                dtype = masked.dtype
-                if not np.issubdtype(dtype, np.floating):
-                    dtype = np.dtype(np.float64)
-                return np.ma.asarray(masked, dtype=dtype).filled(np.nan).copy()
-
-            raw = np.asarray(arr)
-            dtype = np.dtype(raw.dtype)
-            if not np.issubdtype(dtype, np.floating):
-                dtype = np.dtype(np.float64)
-            return np.asarray(raw, dtype=dtype).copy()
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Cannot convert {name} to numpy array: {exc}") from exc
+        return process_input_array(arr, name, copy=True)
 
     def _validate_input_data(
         self, layout: str = "auto", raw_flags: object = None
@@ -259,9 +254,7 @@ class ReducedVectorWind:
         expected = int(self.pl.sum())
         norm_layout = str(layout).lower()
         if norm_layout not in ("legacy", "c", "auto"):
-            raise ValueError(
-                f'layout must be "legacy", "c", or "auto", got "{layout}"'
-            )
+            raise ValueError(f'layout must be "legacy", "c", or "auto", got "{layout}"')
 
         if self.u.ndim == 1:
             if self.u.shape[0] != expected:
@@ -309,11 +302,7 @@ class ReducedVectorWind:
         return resolved_layout, extra_shape
 
     def _validate_scalar_field(self, field: ArrayLike, name: str) -> np.ndarray:
-        try:
-            field = field.filled(np.nan) if hasattr(field, "filled") else field
-        except AttributeError:
-            pass
-        array = np.asarray(field)
+        array = unwrap_masked_scalar(field)
         if array.shape != self.u.shape:
             raise ValueError(f"{name} is not compatible")
         if not np.isfinite(array).all():
@@ -399,7 +388,7 @@ class ReducedVectorWind:
             omega=omega,
             dtype=self._u_backend.dtype,
             shape=self._u_backend.shape,
-            point_axis=0,
+            point_axis=-1,
         )
 
     def _planetary_vorticity_spec(
@@ -412,7 +401,9 @@ class ReducedVectorWind:
         if cached is not None:
             return cached
 
-        dataspec = self.s._analyze_scalar(self._planetary_vorticity_grid(omega), ntrunc)
+        dataspec = self.s._analyze_scalar(
+            self._planetary_vorticity_grid(omega), ntrunc, c_order=True
+        )
         self._planetary_vorticity_spec_cache[key] = dataspec
         return dataspec
 
@@ -424,6 +415,18 @@ class ReducedVectorWind:
     def _ntrunc(self, truncation: Optional[int]) -> int:
         return self.s._validate_ntrunc(truncation)
 
+    def _ensure_c_spec(self, spec: np.ndarray, ntrunc: int) -> np.ndarray:
+        """Normalize cached spectral coefficient blocks to (nt, nmdim)."""
+        nmdim = (ntrunc + 1) * (ntrunc + 2) // 2
+        arr = np.asarray(spec)
+        if arr.ndim == 2 and arr.shape == (self._nt, nmdim):
+            return arr
+        if arr.ndim == 2 and arr.shape == (nmdim, self._nt):
+            return np.ascontiguousarray(arr.T)
+        if arr.ndim == 1 and self._nt == 1 and arr.shape[0] == nmdim:
+            return arr.reshape(1, nmdim)
+        return arr
+
     def _spectogrd_pair(
         self,
         spec_a: np.ndarray,
@@ -432,7 +435,9 @@ class ReducedVectorWind:
         output_dtype: Optional[np.dtype] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         ntrunc = self._ntrunc(truncation)
-        grid_a, grid_b = self.s._synthesize_scalar_pair(spec_a, spec_b, ntrunc)
+        grid_a, grid_b = self.s._synthesize_scalar_pair(
+            spec_a, spec_b, ntrunc, c_order=True
+        )
         return self._restore_grid(grid_a, output_dtype), self._restore_grid(
             grid_b, output_dtype
         )
@@ -444,7 +449,9 @@ class ReducedVectorWind:
         output_dtype: Optional[np.dtype] = None,
     ) -> np.ndarray:
         ntrunc = self._ntrunc(truncation)
-        return self._restore_grid(self.s._synthesize_scalar(spec, ntrunc), output_dtype)
+        return self._restore_grid(
+            self.s._synthesize_scalar(spec, ntrunc, c_order=True), output_dtype
+        )
 
     def _vector_analysis_spectral(
         self, truncation: Optional[int]
@@ -453,10 +460,13 @@ class ReducedVectorWind:
         key = ("vrtdiv", ntrunc)
         cached = self._spectral_cache.get(key)
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return (
+                self._ensure_c_spec(cached[0], ntrunc),  # type: ignore[index]
+                self._ensure_c_spec(cached[1], ntrunc),  # type: ignore[index]
+            )
 
         vrtspec, divspec = self.s._analyze_wind(
-            self._u_backend, self._v_backend, ntrunc
+            self._u_backend, self._v_backend, ntrunc, c_order=True
         )
         self._spectral_cache[key] = (vrtspec, divspec)
         self._spectral_cache[("vrt", ntrunc)] = vrtspec
@@ -468,14 +478,14 @@ class ReducedVectorWind:
         key = ("vrt", ntrunc)
         cached = self._spectral_cache.get(key)
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return self._ensure_c_spec(cached, ntrunc)  # type: ignore[arg-type]
 
         full = self._spectral_cache.get(("vrtdiv", ntrunc))
         if full is not None:
-            vrtspec = full[0]  # type: ignore[index]
+            vrtspec = self._ensure_c_spec(full[0], ntrunc)  # type: ignore[index]
         else:
             vrtspec = self.s._analyze_vorticity(
-                self._u_backend, self._v_backend, ntrunc
+                self._u_backend, self._v_backend, ntrunc, c_order=True
             )
         self._spectral_cache[key] = vrtspec
         return vrtspec
@@ -485,14 +495,14 @@ class ReducedVectorWind:
         key = ("div", ntrunc)
         cached = self._spectral_cache.get(key)
         if cached is not None:
-            return cached  # type: ignore[return-value]
+            return self._ensure_c_spec(cached, ntrunc)  # type: ignore[arg-type]
 
         full = self._spectral_cache.get(("vrtdiv", ntrunc))
         if full is not None:
-            divspec = full[1]  # type: ignore[index]
+            divspec = self._ensure_c_spec(full[1], ntrunc)  # type: ignore[index]
         else:
             divspec = self.s._analyze_divergence(
-                self._u_backend, self._v_backend, ntrunc
+                self._u_backend, self._v_backend, ntrunc, c_order=True
             )
         self._spectral_cache[key] = divspec
         return divspec
@@ -533,30 +543,30 @@ class ReducedVectorWind:
         """Return streamfunction and velocity potential."""
         vrtspec, divspec = self._vector_analysis_spectral(truncation)
         return self._spectogrd_pair(
-            self.s._invlap(vrtspec),
-            self.s._invlap(divspec),
+            self.s._invlap(vrtspec, c_order=True),
+            self.s._invlap(divspec, c_order=True),
             truncation,
         )
 
     def streamfunction(self, truncation: Optional[int] = None) -> np.ndarray:
         """Return streamfunction."""
         vrtspec = self._vorticity_spectral(truncation)
-        return self._spectogrd(self.s._invlap(vrtspec), truncation)
+        return self._spectogrd(self.s._invlap(vrtspec, c_order=True), truncation)
 
     def velocitypotential(self, truncation: Optional[int] = None) -> np.ndarray:
         """Return velocity potential."""
         divspec = self._divergence_spectral(truncation)
-        return self._spectogrd(self.s._invlap(divspec), truncation)
+        return self._spectogrd(self.s._invlap(divspec, c_order=True), truncation)
 
     def helmholtz(
         self, truncation: Optional[int] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return irrotational and non-divergent wind components."""
         vrtspec, divspec = self._vector_analysis_spectral(truncation)
-        psispec = self.s._invlap(vrtspec)
-        chispec = self.s._invlap(divspec)
+        psispec = self.s._invlap(vrtspec, c_order=True)
+        chispec = self.s._invlap(divspec, c_order=True)
         u_chi, v_chi, v_psi, u_psi = self.s._synthesize_gradient_pair(
-            chispec, psispec, truncation
+            chispec, psispec, truncation, c_order=True
         )
         return (
             self._restore_grid(u_chi),
@@ -570,7 +580,9 @@ class ReducedVectorWind:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return irrotational wind component."""
         divspec = self._divergence_spectral(truncation)
-        u_chi, v_chi = self.s._synthesize_gradient(self.s._invlap(divspec), truncation)
+        u_chi, v_chi = self.s._synthesize_gradient(
+            self.s._invlap(divspec, c_order=True), truncation, c_order=True
+        )
         return self._restore_grid(u_chi), self._restore_grid(v_chi)
 
     def nondivergentcomponent(
@@ -578,26 +590,34 @@ class ReducedVectorWind:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return non-divergent wind component."""
         vrtspec = self._vorticity_spectral(truncation)
-        psispec = self.s._invlap(vrtspec)
-        v_psi, u_psi = self.s._synthesize_gradient(psispec, truncation)
+        psispec = self.s._invlap(vrtspec, c_order=True)
+        v_psi, u_psi = self.s._synthesize_gradient(psispec, truncation, c_order=True)
         return self._restore_grid(-u_psi), self._restore_grid(v_psi)
+
+    def _scalar_grid_spec(
+        self, scalar: ArrayLike, name: str, truncation: Optional[int]
+    ) -> Tuple[np.ndarray, np.dtype]:
+        """Validate scalar field and analyze into C-order (nt, nmdim) spectra."""
+        output_dtype = self._infer_output_dtype(scalar)
+        compute_dtype = (
+            _DTYPE_F64
+            if self._resolved_output_dtype(output_dtype) == _DTYPE_F64
+            else _DTYPE_F32
+        )
+        field = self._validate_scalar_field(scalar, name)
+        spec = self.s._analyze_scalar(
+            self._normalize_grid_backend(field, compute_dtype=compute_dtype),
+            truncation,
+            c_order=True,
+        )
+        return spec, output_dtype
 
     def gradient(
         self, chi: ArrayLike, truncation: Optional[int] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Return vector gradient of a packed scalar field."""
-        output_dtype = self._infer_output_dtype(chi)
-        compute_dtype = (
-            np.dtype(np.float64)
-            if self._resolved_output_dtype(output_dtype) == np.dtype(np.float64)
-            else np.dtype(np.float32)
-        )
-        field = self._validate_scalar_field(chi, "chi")
-        chi_spec = self.s._analyze_scalar(
-            self._normalize_grid_backend(field, compute_dtype=compute_dtype),
-            truncation,
-        )
-        u_chi, v_chi = self.s._synthesize_gradient(chi_spec, truncation)
+        chi_spec, output_dtype = self._scalar_grid_spec(chi, "chi", truncation)
+        u_chi, v_chi = self.s._synthesize_gradient(chi_spec, truncation, c_order=True)
         return (
             self._restore_grid(u_chi, output_dtype),
             self._restore_grid(v_chi, output_dtype),
@@ -607,40 +627,28 @@ class ReducedVectorWind:
         self, field: ArrayLike, truncation: Optional[int] = None
     ) -> np.ndarray:
         """Apply spectral truncation to a packed scalar field."""
-        output_dtype = self._infer_output_dtype(field)
-        compute_dtype = (
-            np.dtype(np.float64)
-            if self._resolved_output_dtype(output_dtype) == np.dtype(np.float64)
-            else np.dtype(np.float32)
-        )
-        scalar = self._validate_scalar_field(field, "field")
-        field_spec = self.s._analyze_scalar(
-            self._normalize_grid_backend(scalar, compute_dtype=compute_dtype),
-            truncation,
-        )
+        field_spec, output_dtype = self._scalar_grid_spec(field, "field", truncation)
         return self._spectogrd(field_spec, truncation, output_dtype)
 
-    def invlap(
-        self, field: ArrayLike, truncation: Optional[int] = None
-    ) -> np.ndarray:
+    def invlap(self, field: ArrayLike, truncation: Optional[int] = None) -> np.ndarray:
         """Solve the spherical Poisson equation ``nabla^2 psi = field`` on the packed grid."""
-        output_dtype = self._infer_output_dtype(field)
-        scalar = self._validate_scalar_field(field, "field")
-        field_spec = self.s.grdtospec(scalar, ntrunc=truncation)
-        inv_spec = self.s.invlapspec(field_spec)
-        return self._restore_output_dtype(
-            self.s.spectogrd(inv_spec), output_dtype
-        )
+        field_spec, output_dtype = self._scalar_grid_spec(field, "field", truncation)
+        inv_spec = self.s._invlap(field_spec, c_order=True)
+        return self._spectogrd(inv_spec, truncation, output_dtype)
 
     def rossbywavesource(
         self, truncation: Optional[int] = None, omega: Optional[float] = None
     ) -> np.ndarray:
         """Return Rossby wave source on the packed reduced grid."""
         vrtspec, divspec = self._vector_analysis_spectral(truncation)
-        vrt, div = self.s._synthesize_scalar_pair(vrtspec, divspec, truncation)
+        vrt, div = self.s._synthesize_scalar_pair(
+            vrtspec, divspec, truncation, c_order=True
+        )
         eta = vrt + self._planetary_vorticity_grid(omega=omega)
-        uchi, vchi = self.s._synthesize_gradient(self.s._invlap(divspec), truncation)
+        chispec = self.s._invlap(divspec, c_order=True)
         etaspec = vrtspec + self._planetary_vorticity_spec(truncation, omega=omega)
-        etax, etay = self.s._synthesize_gradient(etaspec, truncation)
+        uchi, vchi, etax, etay = self.s._synthesize_gradient_pair(
+            chispec, etaspec, truncation, c_order=True
+        )
         rws = -eta * div - (uchi * etax + vchi * etay)
         return self._restore_grid(rws)

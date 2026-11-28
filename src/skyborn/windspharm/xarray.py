@@ -26,8 +26,7 @@ Example:
 
 from __future__ import annotations
 
-import warnings
-from typing import Any, Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Literal, Optional, Tuple
 
 import numpy as np
 import xarray as xr
@@ -40,6 +39,32 @@ from ._common import get_apiorder, inspect_gridtype
 # Type aliases for better readability
 DataArray = xr.DataArray
 LegFunc = str  # 'stored' or 'computed'
+
+
+def _validate_pair_coordinates(u: DataArray, v: DataArray) -> None:
+    """Validate that two xarray DataArrays share identical dims and coordinate values."""
+    if u.dims != v.dims:
+        raise ValueError(
+            f"u and v must have identical dimensions. Got u: {u.dims}, v: {v.dims}"
+        )
+
+    mismatched_coords = []
+    for dim in u.dims:
+        uc = u.coords[dim].values
+        vc = v.coords[dim].values
+        if uc is vc and type(uc) is np.ndarray:
+            continue
+        try:
+            if not (uc == vc).all():
+                mismatched_coords.append(dim)
+        except (ValueError, TypeError):
+            mismatched_coords.append(dim)
+
+    if mismatched_coords:
+        raise ValueError(
+            f"u and v must have identical coordinate values. "
+            f"Mismatched coordinates: {mismatched_coords}"
+        )
 
 
 class VectorWind:
@@ -203,44 +228,8 @@ class VectorWind:
         self.divergentcomponent = self.irrotationalcomponent
 
     def _validate_coordinates(self, u: DataArray, v: DataArray) -> None:
-        """
-        Validate that u and v have compatible coordinates.
-
-        Parameters
-        ----------
-        u, v : DataArray
-            Wind components to validate
-
-        Raises
-        ------
-        ValueError
-            If dimensions or coordinate values don't match
-        """
-        # Check dimension names
-        if u.dims != v.dims:
-            raise ValueError(
-                f"u and v must have identical dimensions. "
-                f"Got u: {u.dims}, v: {v.dims}"
-            )
-
-        # Check coordinate values
-        u_coords = [u.coords[name].values for name in u.dims]
-        v_coords = [v.coords[name].values for name in v.dims]
-
-        mismatched_coords = []
-        for i, (uc, vc) in enumerate(zip(u_coords, v_coords)):
-            try:
-                if not (uc == vc).all():
-                    mismatched_coords.append(u.dims[i])
-            except (ValueError, TypeError):
-                # Handle different shapes or types
-                mismatched_coords.append(u.dims[i])
-
-        if mismatched_coords:
-            raise ValueError(
-                f"u and v must have identical coordinate values. "
-                f"Mismatched coordinates: {mismatched_coords}"
-            )
+        """Validate that u and v have compatible coordinates."""
+        _validate_pair_coordinates(u, v)
 
     def _metadata(self, data: Any, name: str, **attributes: Any) -> DataArray:
         """
@@ -840,45 +829,10 @@ class VectorWind:
         >>> avrt_u, avrt_v = vw.gradient(abs_vrt)
         >>> avrt_u_t13, avrt_v_t13 = vw.gradient(abs_vrt, truncation=13)
         """
-        if not isinstance(chi, xr.DataArray):
-            raise TypeError(
-                f"Scalar field must be xarray.DataArray, got {type(chi).__name__}"
-            )
-
+        chi, reorder, needs_transpose, ishape, coords = self._prepare_scalar_dataarray(
+            chi, label="Scalar field"
+        )
         name = chi.name or "field"
-
-        # Process coordinate ordering similar to initialization
-        lat, lat_dim = _find_latitude_coordinate(chi)
-        lon, lon_dim = _find_longitude_coordinate(chi)
-
-        target_s2n = bool(getattr(self._api.s, "south_to_north", False))
-        chi_s2n = bool(lat.values[0] < lat.values[-1])
-        if chi_s2n != target_s2n:
-            chi = _reverse(chi, lat_dim)
-            lat, lat_dim = _find_latitude_coordinate(chi)
-
-        reorder = chi.dims
-        use_c_layout = getattr(self._api, "_layout", "legacy") == "c"
-        if use_c_layout:
-            needs_transpose = not (
-                lat_dim == chi.ndim - 2 and lon_dim == chi.ndim - 1
-            )
-            if needs_transpose:
-                c_order = [
-                    dim
-                    for idx, dim in enumerate(chi.dims)
-                    if idx not in (lat_dim, lon_dim)
-                ] + [chi.dims[lat_dim], chi.dims[lon_dim]]
-                chi = chi.transpose(*c_order)
-        else:
-            apiorder, _ = get_apiorder(chi.ndim, lat_dim, lon_dim)
-            apiorder = [chi.dims[i] for i in apiorder]
-            needs_transpose = tuple(apiorder) != chi.dims
-            if needs_transpose:
-                chi = chi.transpose(*apiorder)
-
-        ishape = chi.shape
-        coords = [chi.coords[n] for n in chi.dims]
 
         # Compute gradient using standard API
         u_grad, v_grad = self._api.gradient(chi.values, truncation=truncation)
@@ -987,12 +941,12 @@ class VectorWind:
         )
 
     def _prepare_scalar_dataarray(
-        self, field: DataArray
+        self, field: DataArray, label: str = "Field"
     ) -> Tuple[DataArray, Tuple[Any, ...], bool, Tuple[int, ...], list[Any]]:
         """Align a scalar DataArray to the underlying API's lat/lon order and layout."""
         if not isinstance(field, xr.DataArray):
             raise TypeError(
-                f"Field must be xarray.DataArray, got {type(field).__name__}"
+                f"{label} must be xarray.DataArray, got {type(field).__name__}"
             )
 
         lat, lat_dim = _find_latitude_coordinate(field)
@@ -1093,9 +1047,7 @@ class VectorWind:
             self._prepare_scalar_dataarray(field)
         )
 
-        field_inv = np.asarray(
-            self._api.invlap(prepared.values, truncation=truncation)
-        )
+        field_inv = np.asarray(self._api.invlap(prepared.values, truncation=truncation))
         if field_inv.shape != ishape:
             field_inv = field_inv.reshape(ishape)
 
@@ -1173,16 +1125,18 @@ class ReducedVectorWind:
 
         self._ishape = u.shape
         self._coords = [u.coords[name] for name in u.dims]
+        u_values = u.values
+        v_values = v.values
         self._u_component_dtype = reduced.ReducedVectorWind._infer_output_dtype(
-            u.values
+            u_values
         )
         self._v_component_dtype = reduced.ReducedVectorWind._infer_output_dtype(
-            v.values
+            v_values
         )
 
         self._api = reduced.ReducedVectorWind(
-            u.values,
-            v.values,
+            u_values,
+            v_values,
             pl_arr,
             rsphere=rsphere,
             legfunc=legfunc,
@@ -1201,25 +1155,7 @@ class ReducedVectorWind:
         self.divergentcomponent = self.irrotationalcomponent
 
     def _validate_coordinates(self, u: DataArray, v: DataArray) -> None:
-        if u.dims != v.dims:
-            raise ValueError(
-                f"u and v must have identical dimensions. "
-                f"Got u: {u.dims}, v: {v.dims}"
-            )
-
-        mismatched_coords = []
-        for dim in u.dims:
-            try:
-                if not (u.coords[dim].values == v.coords[dim].values).all():
-                    mismatched_coords.append(dim)
-            except (ValueError, TypeError):
-                mismatched_coords.append(dim)
-
-        if mismatched_coords:
-            raise ValueError(
-                f"u and v must have identical coordinate values. "
-                f"Mismatched coordinates: {mismatched_coords}"
-            )
+        _validate_pair_coordinates(u, v)
 
     def _metadata(self, data: Any, name: str, **attributes: Any) -> DataArray:
         result = xr.DataArray(

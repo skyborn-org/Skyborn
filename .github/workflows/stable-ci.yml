@@ -14,6 +14,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential gfortran pkg-config
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v7
@@ -22,13 +26,10 @@ jobs:
 
       - name: Install dependencies and Skyborn
         run: |
-          python -m pip install --upgrade pip setuptools wheel meson ninja "cython>=3.0.0" numpy
-          pip install skyborn-plot skyborn-spharm skyborn-backend || {
-            pip install --no-build-isolation \
-              git+https://github.com/skyborn-org/skyborn-plot.git \
-              git+https://github.com/skyborn-org/skyborn-spharm.git \
-              git+https://github.com/skyborn-org/skyborn-backend.git
-          }
+          python -m pip install --upgrade pip setuptools wheel meson ninja maturin "cython>=3.0.0" numpy
+          pip install "skyborn-plot>=0.1.0" || pip install --no-build-isolation git+https://github.com/skyborn-org/skyborn-plot.git
+          pip install "skyborn-spharm>=0.2.0" || pip install --no-build-isolation git+https://github.com/skyborn-org/skyborn-spharm.git
+          pip install "skyborn-backend>=0.1.0" || pip install --no-build-isolation git+https://github.com/skyborn-org/skyborn-backend.git
           pip install -r requirements/base.txt --no-deps || true
           pip install pytest pandas xarray matplotlib netCDF4 metpy tqdm statsmodels scipy scikit-learn dask
           pip install --no-deps -e .
